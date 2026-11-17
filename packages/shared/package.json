@@ -1,0 +1,13 @@
+{
+  "name": "@sellerflow/shared",
+  "version": "1.0.0",
+  "description": "Shared TypeScript types and financial contracts for SellerFlow AI",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
