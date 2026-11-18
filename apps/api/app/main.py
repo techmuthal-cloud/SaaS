@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import engine, Base
 from app.core.logging import RequestIDMiddleware, logger
+from app.core.security import validate_jwt_secret
 from app.routes.api_v1 import router as api_v1_router
 
 # Ensure tables are created in development/SQLite
@@ -32,6 +33,8 @@ app.include_router(api_v1_router, prefix=settings.API_V1_PREFIX)
 
 @app.on_event("startup")
 async def startup_event():
+    # Require deployment-provided secret and fail startup if missing or a known placeholder
+    validate_jwt_secret(settings.JWT_SECRET_KEY)
     logger.info("SellerFlow AI backend service initialized with tenant isolation and deterministic reconciliation.")
 
 @app.get("/")

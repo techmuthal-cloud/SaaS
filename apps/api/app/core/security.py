@@ -4,76 +4,123 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import Header, HTTPException, status, Depends
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.entities import User, Workspace, WorkspaceMember
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+KNOWN_INSECURE_PLACEHOLDERS = {
+    "sellerflow-dev-secret-key-change-in-production-2026",
+    "change-me-in-production-sellerflow-key-2026",
+    "generate-a-strong-random-secret-key-for-production",
+    "secret",
+    "changeme",
+    "password",
+    "admin",
+    "default",
+    "test",
+    "jwt_secret",
+}
 
-SECRET_KEY = getattr(settings, "JWT_SECRET_KEY", "sellerflow-dev-secret-key-change-in-production-2026")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+def validate_jwt_secret(secret: Optional[str]) -> str:
+    """
+    Validates that a deployment-provided secret exists and is not a known placeholder.
+    Fails startup with RuntimeError if invalid.
+    """
+    if not secret or not str(secret).strip():
+        raise RuntimeError(
+            "FATAL: JWT_SECRET_KEY is missing. A deployment-provided secret must be supplied "
+            "via the JWT_SECRET_KEY environment variable. Startup aborted."
+        )
+    clean_secret = str(secret).strip().lower()
+    if clean_secret in KNOWN_INSECURE_PLACEHOLDERS or len(str(secret).strip()) < 16:
+        raise RuntimeError(
+            "FATAL: JWT_SECRET_KEY is set to an insecure known placeholder or is too short (min 16 chars). "
+            "Please configure a strong, unique secret in your deployment environment."
+        )
+    return str(secret).strip()
+
+def get_jwt_secret() -> str:
+    return validate_jwt_secret(settings.JWT_SECRET_KEY)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    if not plain_password or not hashed_password:
+        return False
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8")[:72], hashed_password.encode("utf-8"))
+    except Exception:
+        return False
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode("utf-8")[:72], salt).decode("utf-8")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    secret = get_jwt_secret()
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(to_encode, secret, algorithm=settings.JWT_ALGORITHM)
 
-def get_current_user_optional(
+def get_current_user(
     authorization: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
     db: Session = Depends(get_db)
-) -> Optional[User]:
+) -> User:
     """
-    Extracts current authenticated user from Bearer JWT or test header.
-    In production, Bearer JWT is validated.
+    Enforces validated Bearer JWT authentication.
+    Client-supplied identity headers (such as X-User-ID) are strictly removed and ignored.
     """
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-        try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            user_id: str = payload.get("sub")
-            if user_id:
-                user = db.query(User).filter(User.id == user_id).first()
-                if user:
-                    return user
-        except JWTError:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: Missing or invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        secret = get_jwt_secret()
+        payload = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired authentication credentials"
+                detail="Invalid token payload: missing subject identifier",
+                headers={"WWW-Authenticate": "Bearer"},
             )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    if x_user_id:
-        user = db.query(User).filter(User.id == x_user_id).first()
-        if user:
-            return user
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account does not exist or has been deactivated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    return None
+    return user
 
 def verify_tenant_access(
     workspace_id: str,
-    authorization: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
+    current_user: User = Depends(get_current_user),
     x_workspace_id: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> Workspace:
     """
-    Strict Tenant Isolation Check:
-    Verifies that the caller has membership in the target workspace.
-    Fails closed with 401/403.
+    Strict Tenant Isolation & Workspace Authorization Check:
+    1. Authenticates the caller via validated Bearer token.
+    2. Verifies the target workspace exists (404 if missing).
+    3. Validates X-Workspace-Id header matches URL if provided (403 if mismatched).
+    4. Enforces that current_user has an active membership in the target workspace (403 if not).
     """
-    # Verify workspace exists
     workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
     if not workspace:
         raise HTTPException(
@@ -81,34 +128,22 @@ def verify_tenant_access(
             detail=f"Workspace {workspace_id} not found"
         )
 
-    # If X-Workspace-Id header is passed, ensure it matches URL parameter
     if x_workspace_id and x_workspace_id != workspace_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Header X-Workspace-Id does not match path workspace_id"
         )
 
-    user = get_current_user_optional(authorization, x_user_id, db)
-    
-    # If users exist in database, require explicit membership check
-    total_users = db.query(User).count()
-    if total_users > 0:
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required to access workspace data"
-            )
-        
-        member = db.query(WorkspaceMember).filter(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == user.id
-        ).first()
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
 
-        if not member:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied: User {user.id} does not have access to workspace {workspace_id}"
-            )
+    if not member:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: User {current_user.id} does not have access to workspace {workspace_id}"
+        )
 
     return workspace
 

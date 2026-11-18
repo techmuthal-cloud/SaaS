@@ -21,11 +21,17 @@ def seed_staging():
 
         print("Seeding SellerFlow AI staging environment...")
         
-        # Create Admin User
+        # Create Admin User (read password from environment, never hardcode)
+        seed_password = os.environ.get("SEED_ADMIN_PASSWORD")
+        if not seed_password:
+            import secrets
+            seed_password = secrets.token_urlsafe(16)
+            print(f"[SECURITY NOTICE] No SEED_ADMIN_PASSWORD set in env. Generated random staging password: {seed_password}")
+
         user = User(
             email="demo@sellerflow.ai",
             full_name="Demo Seller & CA",
-            hashed_password=get_password_hash("DemoSecret123!")
+            hashed_password=get_password_hash(seed_password)
         )
         db.add(user)
         db.commit()

@@ -17,7 +17,8 @@ from app.core.security import (
     sanitize_for_spreadsheet,
     create_access_token,
     get_password_hash,
-    verify_password
+    verify_password,
+    get_current_user
 )
 from app.core.logging import logger
 from app.models.entities import (
@@ -133,33 +134,79 @@ def login_user(
         "workspace_id": ws_id
     }
 
+@router.get("/auth/me")
+def get_current_user_profile(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    memberships = db.query(WorkspaceMember).filter(WorkspaceMember.user_id == current_user.id).all()
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "workspaces": [
+            {"workspace_id": m.workspace_id, "role": m.role}
+            for m in memberships
+        ]
+    }
+
 # ----------------- Workspaces (Tenant-Scoped) -----------------
 @router.get("/workspaces")
-def list_workspaces(db: Session = Depends(get_db)):
-    workspaces = db.query(Workspace).all()
-    if not workspaces:
-        ws = Workspace(name="My E-Commerce Business", subscription_tier="free")
-        db.add(ws)
-        db.commit()
-        db.refresh(ws)
-        db.add(Store(workspace_id=ws.id, display_name="Amazon India Store", marketplace_code="amazon_in"))
-        db.add(Store(workspace_id=ws.id, display_name="Flipkart India Store", marketplace_code="flipkart"))
-        db.add(Store(workspace_id=ws.id, display_name="Meesho Supplier Store", marketplace_code="meesho"))
-        db.commit()
-        workspaces = [ws]
-    return [{"id": w.id, "name": w.name, "subscription_tier": w.subscription_tier} for w in workspaces]
+def list_workspaces(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    List workspaces where the authenticated user is an active member.
+    Unauthenticated users are rejected with 401. Users only see their own workspaces.
+    """
+    memberships = db.query(WorkspaceMember).filter(WorkspaceMember.user_id == current_user.id).all()
+    workspace_ids = [m.workspace_id for m in memberships]
+    if not workspace_ids:
+        return []
+    
+    workspaces = db.query(Workspace).filter(Workspace.id.in_(workspace_ids)).all()
+    role_map = {m.workspace_id: m.role for m in memberships}
+    return [
+        {
+            "id": w.id,
+            "name": w.name,
+            "subscription_tier": w.subscription_tier,
+            "role": role_map.get(w.id, "member")
+        }
+        for w in workspaces
+    ]
 
 @router.post("/workspaces")
-def create_workspace(name: str = Form(...), db: Session = Depends(get_db)):
-    ws = Workspace(name=name, subscription_tier="free")
-    db.add(ws)
-    db.commit()
-    db.refresh(ws)
-    db.add(Store(workspace_id=ws.id, display_name=f"{name} Amazon", marketplace_code="amazon_in"))
-    db.add(Store(workspace_id=ws.id, display_name=f"{name} Flipkart", marketplace_code="flipkart"))
-    db.add(Store(workspace_id=ws.id, display_name=f"{name} Meesho", marketplace_code="meesho"))
-    db.commit()
-    return {"id": ws.id, "name": ws.name, "subscription_tier": ws.subscription_tier}
+def create_workspace(
+    name: str = Form(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Creates a new workspace and assigns current_user as owner in the same atomic database transaction.
+    """
+    try:
+        ws = Workspace(name=name, subscription_tier="free")
+        db.add(ws)
+        db.flush()
+
+        # Add creator as owner in the same transaction
+        member = WorkspaceMember(workspace_id=ws.id, user_id=current_user.id, role="owner")
+        db.add(member)
+
+        # Seed initial stores
+        db.add(Store(workspace_id=ws.id, display_name=f"{name} Amazon", marketplace_code="amazon_in"))
+        db.add(Store(workspace_id=ws.id, display_name=f"{name} Flipkart", marketplace_code="flipkart"))
+        db.add(Store(workspace_id=ws.id, display_name=f"{name} Meesho", marketplace_code="meesho"))
+
+        db.commit()
+        db.refresh(ws)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create workspace: {str(e)}")
+
+    return {"id": ws.id, "name": ws.name, "subscription_tier": ws.subscription_tier, "role": "owner"}
 
 @router.get("/workspaces/{workspace_id}/stores")
 def get_stores(
