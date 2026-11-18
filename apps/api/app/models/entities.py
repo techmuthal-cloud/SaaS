@@ -14,10 +14,12 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
+    clerk_id = Column(String(255), unique=True, index=True, nullable=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
     full_name = Column(String(255), nullable=True)
     hashed_password = Column(String(255), nullable=True)
     is_active = Column(Boolean, default=True)
+    is_superuser = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     memberships = relationship("WorkspaceMember", back_populates="user", cascade="all, delete-orphan")
@@ -104,6 +106,8 @@ class ImportRecord(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     workspace_id = Column(String(36), ForeignKey("workspaces.id"), nullable=False, index=True)
     store_id = Column(String(36), ForeignKey("stores.id"), nullable=True, index=True)
+    job_id = Column(String(36), nullable=True, index=True)
+    idempotency_key = Column(String(128), nullable=True, index=True)
     file_name = Column(String(255), nullable=False)
     storage_path = Column(Text, nullable=False)
     sha256 = Column(String(64), nullable=False, index=True)
@@ -116,6 +120,7 @@ class ImportRecord(Base):
     rejected_count = Column(BigInteger, default=0)
     error_summary = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
 
     workspace = relationship("Workspace", back_populates="imports")
     store = relationship("Store", back_populates="imports")

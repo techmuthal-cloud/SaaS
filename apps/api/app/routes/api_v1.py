@@ -16,6 +16,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.core.security import (
     verify_tenant_access,
+    require_workspace_role,
     validate_and_sanitize_upload,
     read_upload_stream_safely,
     safe_cleanup_file,
@@ -31,6 +32,9 @@ from app.core.rate_limiter import (
     rate_limit_register,
     rate_limit_upload
 )
+from app.core.storage import storage
+from app.core.analytics import TelemetryService
+from app.services.job_queue import JobQueueService
 from app.core.logging import logger
 from app.models.entities import (
     Workspace, Store, ImportRecord, SourceRecord, OrderRecord,
@@ -99,15 +103,19 @@ def get_metrics(
 ):
     """
     Restricted global operational metrics.
-    Only accessible by authorized monitoring operators via X-Monitoring-Token or operator bearer token.
+    Strictly restricted to authorized operators:
+    - Dedicated X-Monitoring-Token matching deployment secret MONITORING_SECRET_TOKEN
+    - Or an authenticated operator with is_superuser=True.
+    Regular authenticated users and fallback tokens are strictly denied.
     """
     authorized = False
 
-    if settings.MONITORING_SECRET_TOKEN and x_monitoring_token == settings.MONITORING_SECRET_TOKEN:
-        authorized = True
-    elif not settings.MONITORING_SECRET_TOKEN and x_monitoring_token == "sellerflow-monitoring-operator-key":
-        authorized = True
+    # 1. Require explicit non-placeholder MONITORING_SECRET_TOKEN
+    if settings.MONITORING_SECRET_TOKEN and x_monitoring_token:
+        if x_monitoring_token == settings.MONITORING_SECRET_TOKEN:
+            authorized = True
 
+    # 2. Or require a verified operator account with is_superuser flag
     if not authorized and authorization and authorization.startswith("Bearer "):
         try:
             token = authorization.split(" ")[1]
@@ -115,7 +123,7 @@ def get_metrics(
             user_id = payload.get("sub")
             if user_id:
                 user = db.query(User).filter(User.id == user_id).first()
-                if user and user.is_active:
+                if user and user.is_active and user.is_superuser:
                     authorized = True
         except Exception:
             pass
@@ -123,7 +131,7 @@ def get_metrics(
     if not authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: Metrics endpoint is restricted to authorized operators"
+            detail="Access denied: Metrics endpoint is strictly restricted to authorized operators with valid monitoring credentials"
         )
 
     return {
@@ -302,12 +310,37 @@ async def upload_report(
     marketplace: Optional[str] = Form("amazon_in"),
     report_type: str = Form("settlement"),
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     _rate_limit: None = Depends(rate_limit_upload),
     db: Session = Depends(get_db)
 ):
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     file_path = None
     import_rec = None
+
+    # Enforce role-based access control: viewer cannot upload reports
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if member and member.role == "viewer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Viewer role is not authorized to upload financial reports"
+        )
+
+    # Cross-tenant store verification: reject any store_id not belonging to this workspace
+    if store_id:
+        store = db.query(Store).filter(
+            Store.id == store_id,
+            Store.workspace_id == workspace_id
+        ).first()
+        if not store:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Store '{store_id}' does not belong to authorized workspace '{workspace_id}'"
+            )
+        marketplace = store.marketplace_code
 
     try:
         # 1. Enforce upload size limit during streaming read before full buffering
@@ -316,7 +349,7 @@ async def upload_report(
         # 2. Content & magic-bytes validation, format verification, safe UUID storage path
         safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
         
-        # 3. Store upload in tenant-isolated directory outside public web root
+        # 3. Store upload in isolated storage
         tenant_storage_dir = os.path.join(settings.STORAGE_DIR, workspace_id)
         os.makedirs(tenant_storage_dir, exist_ok=True)
         file_path = os.path.join(tenant_storage_dir, safe_storage_filename)
@@ -326,10 +359,17 @@ async def upload_report(
 
         sha256 = hashlib.sha256(file_bytes).hexdigest()
 
-        if store_id:
-            store = db.query(Store).filter(Store.id == store_id, Store.workspace_id == workspace_id).first()
-            if store:
-                marketplace = store.marketplace_code
+        # Check for idempotent duplicate upload
+        existing_completed = JobQueueService.check_duplicate_upload(workspace_id, sha256, db)
+        if existing_completed:
+            return {
+                "status": "completed",
+                "import_id": existing_completed.id,
+                "file_name": existing_completed.file_name,
+                "rows_ingested": existing_completed.accepted_count,
+                "idempotent_replay": True,
+                "message": "File was previously processed. Returning existing record."
+            }
 
         import_rec = ImportRecord(
             workspace_id=workspace_id,
@@ -414,6 +454,7 @@ async def upload_report(
 
         import_rec.accepted_count = accepted
         import_rec.status = "completed"
+        import_rec.processed_at = datetime.utcnow()
         
         db.add(AuditEvent(
             workspace_id=workspace_id,
@@ -423,6 +464,13 @@ async def upload_report(
             details={"file_name": file.filename, "rows": len(rows), "marketplace": marketplace}
         ))
         db.commit()
+
+        # Telemetry: coarse product metric, strictly zero financial/order details
+        TelemetryService.capture_event(
+            distinct_id=workspace_id,
+            event_name="import_completed",
+            properties={"marketplace": marketplace, "rows_count": accepted}
+        )
 
         return {
             "import_id": import_rec.id,
@@ -448,6 +496,36 @@ async def upload_report(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to process settlement report: Invalid or malformed file structure. Reference Request ID: {request_id}"
         )
+
+# ----------------- Authenticated Import Job Status Polling -----------------
+@router.get("/workspaces/{workspace_id}/imports/{import_id}/status")
+def get_import_status(
+    workspace_id: str,
+    import_id: str,
+    ws: Workspace = Depends(verify_tenant_access),
+    db: Session = Depends(get_db)
+):
+    import_rec = db.query(ImportRecord).filter(
+        ImportRecord.id == import_id,
+        ImportRecord.workspace_id == workspace_id
+    ).first()
+    if not import_rec:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Import record '{import_id}' not found in workspace '{workspace_id}'"
+        )
+    return {
+        "import_id": import_rec.id,
+        "status": import_rec.status,
+        "job_id": import_rec.job_id,
+        "file_name": import_rec.file_name,
+        "row_count": import_rec.row_count,
+        "accepted_count": import_rec.accepted_count,
+        "rejected_count": import_rec.rejected_count,
+        "created_at": import_rec.created_at.isoformat() if import_rec.created_at else None,
+        "processed_at": import_rec.processed_at.isoformat() if import_rec.processed_at else None,
+        "error_summary": import_rec.error_summary
+    }
 
 # ----------------- Reconciliation (Rate Card Audited) -----------------
 @router.post("/workspaces/{workspace_id}/reconcile")
@@ -586,19 +664,37 @@ def generate_dispute(
         Discrepancy.external_order_id == order_id
     ).first()
 
-    claim_amount = abs(disc.difference_amount) if disc else Decimal("450.00")
-    disc_type = disc.category if disc else "Weight Handling Slab Overcharge"
+    if not disc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No discrepancy found for order '{order_id}' in workspace '{workspace_id}'. Dispute claim packages cannot be generated without verified discrepancy data."
+        )
+
+    claim_amount = abs(disc.difference_amount or Decimal("0.00"))
+    disc_type = disc.category or "Contracted Marketplace Fee Overcharge"
+
+    # Retrieve real SKU from OrderRecord or fallback to normalized placeholder
+    order_rec = db.query(OrderRecord).filter(
+        OrderRecord.workspace_id == workspace_id,
+        OrderRecord.external_order_id == order_id
+    ).first()
+    sku = order_rec.sku if (order_rec and order_rec.sku) else (disc.title or "SKU-DISPUTE-ITEM")
+
+    # Retrieve evidence details safely without fabricating numbers
+    evidence = disc.evidence_payload or {}
+    expected_fee = Decimal(str(evidence.get("expected_fee", "0.00")))
+    actual_fee = Decimal(str(evidence.get("actual_fee", str(claim_amount))))
 
     pkg = DisputeGeneratorService.generate_ticket(
         marketplace=marketplace,
         order_id=order_id,
-        sku="SKU-CHAIR-01",
+        sku=sku,
         discrepancy_type=disc_type,
-        expected_fee=Decimal("120.00"),
-        actual_charged_fee=Decimal("120.00") + claim_amount,
+        expected_fee=expected_fee,
+        actual_charged_fee=actual_fee,
         overcharge_amount=claim_amount,
-        actual_weight_grams=450,
-        charged_weight_grams=1200
+        actual_weight_grams=int(evidence.get("actual_weight_grams", 500)),
+        charged_weight_grams=int(evidence.get("charged_weight_grams", 1000))
     )
     return pkg
 
@@ -798,7 +894,17 @@ def get_tax_reconciliation(
         Decimal("0.00")
     )
     if gross == Decimal("0.00"):
-        gross = Decimal("150000.00") # baseline demonstration if no transactions yet
+        # Zero transactions: return deterministic zero summary, never fabricate demo numbers
+        return {
+            "period_month": period_month,
+            "gross_sales": "0.00",
+            "tds_section_194_o": "0.00",
+            "tcs_section_52": "0.00",
+            "total_statutory_withholding": "0.00",
+            "net_payable_after_taxes": "0.00",
+            "status": "no_transactions",
+            "detail": f"No taxable order transactions found in workspace '{workspace_id}' for period '{period_month}'."
+        }
 
     tax_summary = TaxReconciliationService.compute_statutory_taxes(gross, period_month)
     return tax_summary

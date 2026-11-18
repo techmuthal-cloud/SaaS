@@ -6,8 +6,11 @@ from app.core.logging import RequestIDMiddleware, logger
 from app.core.security import validate_jwt_secret
 from app.routes.api_v1 import router as api_v1_router
 
-# Ensure tables are created in development/SQLite
-Base.metadata.create_all(bind=engine)
+# Schema initialization:
+# Auto-create tables only in local development/test environments.
+# In production/staging, schema management is strictly executed via Alembic migrations.
+if settings.ENVIRONMENT in ("development", "test"):
+    Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

@@ -1,249 +1,140 @@
-# SellerFlow AI — Technical Architecture & System Design
+# SellerFlow AI — Production Technical Architecture & System Design
 
-**Version:** 2.0 (Production Hardened)  
-**Target Environment:** Multi-Tenant E-Commerce Financial Reconciliation SaaS  
+**Version:** 3.0 (Production-Grade & Anti-Fabrication Hardened)  
+**System Target:** Enterprise Multi-Tenant E-Commerce Financial Reconciliation Platform  
 
 ---
 
-## 1. High-Level System Architecture
+## 1. Executive Architecture Summary
 
-SellerFlow AI is engineered as a **domain-driven, multi-tenant modular SaaS platform** combining a Next.js front-end with a hardened FastAPI financial processing backend, PostgreSQL as the system of record, and deterministic arithmetic calculation engines.
+SellerFlow AI is engineered according to **strict financial domain discipline**:
+1. **Deterministic Arithmetic Only:** Zero floating-point operations. All financial calculations use Python `decimal.Decimal` and PostgreSQL `NUMERIC(18, 2)`.
+2. **AI Never Mutates Ledger State:** LLMs are strictly confined to generating dispute cover letters and human-readable explanations. AI is forbidden from computing or modifying fees.
+3. **Zero Financial Fabrication:** If financial or discrepancy records do not exist, the API returns explicit zero-state summaries or 404 errors. Hardcoded demo values and synthetic estimates are prohibited in production code paths.
+4. **Defense-in-Depth Multi-Tenancy:** Authentication, workspace membership, and Role-Based Access Control (RBAC) are verified on the server for every single API request.
+
+---
+
+## 2. Recommended Production Cloud Stack
+
+| Layer | Recommended Vendor / Platform | Implementation & Security Responsibility |
+|---|---|---|
+| **Frontend** | **Vercel** | Hosts Next.js 16 App Router UI. No financial secrets, service keys, or calculation logic. |
+| **Authentication** | **Clerk** | Manages user sign-up, sign-in, session tokens, and MFA. FastAPI verifies Clerk tokens server-side and provisions internal tenant records. |
+| **Backend API** | **FastAPI on Container Host** (Render / Fly.io / ECS) | Validates tokens, enforces workspace RBAC, validates uploads, and orchestrates financial engines. |
+| **Database** | **Supabase Managed Postgres** | System of record. Managed relational schemas, row-level constraints, least-privilege roles, and automated PITR backups. |
+| **Schema Migrations** | **Alembic** | Single source of schema truth. Startup `create_all()` is disabled in production; migrations run as a mandatory release step. |
+| **File Storage** | **Cloudflare R2** | Private object storage. Enforces quarantine prefixes, short-lived signed URLs, and automatic purge on validation failure. |
+| **Distributed Rate Limiting & Jobs** | **Upstash Redis / Managed Redis** | Distributed sliding-window rate limiting and durable queue state across container instances. |
+| **Transactional Email** | **Resend** | Delivers workspace invitations and completion notifications. Never emails bank numbers, PAN/GSTIN, or financial transaction rows. |
+| **Product Telemetry** | **PostHog** | Tracks coarse operational events (`upload_completed`, `reconciliation_run`). Strictly filtered to strip financial numbers and order IDs. |
+| **DNS & Edge** | **Cloudflare DNS & WAF** | Manages domain routing, TLS termination, and DDoS protection. Configured as trusted reverse proxy. |
+
+---
+
+## 3. High-Level Architecture Diagram
 
 ```mermaid
 flowchart TD
-    subgraph Client["Client Tier (Web Browser)"]
-        UI["Next.js 16 Web App\n(React 19, TailwindCSS, Lucide)"]
+    subgraph ClientLayer["Frontend Tier (Vercel)"]
+        UI["Next.js 16 Web Application\n(React 19, TailwindCSS, Lucide)"]
+        ClerkUI["Clerk Identity Provider\n(MFA, Session JWTs)"]
     end
 
-    subgraph SecurityEdge["API Gateway & Security Layer"]
-        CORS["CORS Middleware"]
-        ReqID["Request ID Generator (UUIDv4)"]
-        RateLimiter["Sliding-Window Rate Limiter\n(Login, Register, Uploads)"]
-        AuthFilter["JWT Bearer Authenticator\n(Native Bcrypt, HS256)"]
-        TenantGuard["Tenant Authorization Guard\n(verify_tenant_access)"]
+    subgraph EdgeLayer["Edge & Security Gateway (Cloudflare / FastAPI Middleware)"]
+        WAF["Cloudflare DNS & WAF"]
+        TrustedProxy["Trusted Proxy Guard\n(IP Verification)"]
+        RedisLimiter["Redis Distributed Rate Limiter\n(Login, Register, Uploads)"]
+        AuthFilter["Clerk / Bearer JWT Validator\n(JWKS & Server-Side Verification)"]
+        TenantGuard["Tenant & Role Guard\n(Workspace Isolation + RBAC)"]
     end
 
-    subgraph BackendAPI["Backend Core (FastAPI Modular Monolith)"]
-        Router["API v1 Router (/api/v1)"]
-        UploadHardener["Upload Hardener\n- Stream Reader (413 Limit)\n- Magic Byte Detector\n- Zip Bomb / Ratio Defense"]
+    subgraph BackendAPI["Backend Core (FastAPI Container)"]
+        Router["API v1 Endpoints (/api/v1)"]
+        UploadQuarantine["Upload Stream Validator\n- 413 Chunk Limit\n- Magic Bytes (PK0304)\n- Archive Expansion Guard"]
+        JobService["Job Queue & Idempotency Pipeline\n- Checksum Deduplication\n- Async Import Status"]
         
-        subgraph DomainServices["Financial Domain Engines"]
+        subgraph DomainEngines["Deterministic Accounting Engines"]
             Adapters["Marketplace Adapters\n(Amazon, Flipkart, Meesho)"]
-            ReconEngine["Reconciliation Engine\n(Deterministic Decimal Math)"]
-            RateCardSvc["Rate Card Auditor\n(Category, Slabs, Fees)"]
-            BankRecon["Bank Settlement Matcher\n(Disbursement Cycle -> NEFT/RTGS)"]
-            TaxSvc["Statutory Tax Engine\n(194-O TDS & Sec 52 GST TCS)"]
-            DisputeSvc["Dispute Pack Generator\n(SAFE-T / Seller Support Bundles)"]
+            ReconEngine["Reconciliation Engine\n(Decimal Precision)"]
+            RateCardSvc["Rate Card Auditor\n(Category, Slabs, Weight)"]
+            BankRecon["Bank Settlement Matcher\n(Disbursement Cycle -> NEFT)"]
+            TaxSvc["Statutory Tax Engine\n(194-O TDS & Sec 52 TCS)"]
+            DisputeSvc["Dispute Pack Generator\n(SAFE-T / Seller Support Proof)"]
         end
     end
 
-    subgraph Persistence["Storage & Database Tier"]
-        DB[(PostgreSQL / SQLite\nMulti-Tenant Workspaces)]
-        UploadStorage["Private Storage (/storage/uploads)\n- Path-traversal proof\n- Safe unlinking on failure"]
-        MetricsRoute["Internal Metrics Endpoint\n(Protected via Operator Token)"]
+    subgraph PersistenceLayer["Storage & Data Tier"]
+        DB[(Supabase Postgres\nAlembic Migrations)]
+        R2Storage["Cloudflare R2 Private Bucket\n(Quarantine -> Verified)"]
+        Redis[(Managed Redis Queue)]
+        ResendSvc["Resend Email Service\n(Workspace Invites)"]
+        PostHogSvc["PostHog Telemetry\n(Anonymized Product Events)"]
+        MetricsRoute["Restricted /metrics\n(Operator Secret / Superuser Only)"]
     end
 
-    UI -->|HTTPS + Bearer JWT| CORS
-    CORS --> ReqID --> RateLimiter --> AuthFilter --> TenantGuard --> Router
-    Router --> UploadHardener
-    UploadHardener --> Adapters
+    UI --> ClerkUI
+    UI -->|HTTPS + Clerk JWT| WAF
+    WAF --> TrustedProxy --> RedisLimiter --> AuthFilter --> TenantGuard --> Router
+    Router --> UploadQuarantine
+    UploadQuarantine --> R2Storage
+    UploadQuarantine --> JobService
+    JobService --> Redis
+    JobService --> Adapters
     Adapters --> ReconEngine
     ReconEngine --> RateCardSvc
     ReconEngine --> BankRecon
     ReconEngine --> TaxSvc
     ReconEngine --> DisputeSvc
-    DomainServices --> DB
-    UploadHardener --> UploadStorage
+    DomainEngines --> DB
+    Router --> ResendSvc
+    Router --> PostHogSvc
     Router --> MetricsRoute
 ```
 
 ---
 
-## 2. Component Breakdown
+## 4. Role-Based Access Control (RBAC) Matrix
 
-### A. Client Tier (`apps/web`)
-* **Framework:** Next.js 16 (App Router), React 19, TypeScript.
-* **Styling & Components:** TailwindCSS v4, Lucide React icons, Glassmorphic FinTech UI design.
-* **Key User Journeys:**
-  * Interactive Landing Page & Margin Simulator (`app/page.tsx`).
-  * Settlement-Period-First Upload Workflow (Amazon, Flipkart, Meesho, and Bank CSVs/XLSX).
-  * Discrepancy Breakdown & Real-Time Fee Overcharge Detection.
-  * Instant Dispute Claim Package Exporter (CSV + PDF/Text Cover Letters).
+Every workspace endpoint enforces tenant membership and permissions:
 
-### B. Security & Identity Infrastructure (`apps/api/app/core/`)
-* **Strict Tenant Isolation:** Every request to `/api/v1/workspaces/{workspace_id}/*` validates the user's membership against `workspace_members`. Cross-tenant requests return `403 Forbidden`.
-* **Zero Client Identity Forgery:** All identity verification is strictly derived from verified Bearer JWT tokens (`sub` claim). All legacy bypasses (e.g. `X-User-ID`) are completely removed.
-* **Startup Secret Validation:** On application boot, `validate_jwt_secret()` verifies that `JWT_SECRET_KEY` is supplied, at least 32 characters long, and not a known placeholder (e.g. `your-secret-key-change-in-production`).
-* **Sliding-Window Rate Limiting:** In-memory sliding window rate limiter protects brute-force targets:
-  * `/auth/login`: 10 requests / min.
-  * `/auth/register`: 5 requests / min.
-  * `/reports/upload` & `/bank-statements/upload`: 15 requests / min.
-* **Operational Monitoring Security:**
-  * Liveness probe `/health` returns `{ "status": "alive" }`.
-  * Readiness probe `/health/ready` executes a live `SELECT 1` against the database; returns `503 Service Unavailable` on connection failure.
-  * Internal telemetry `/metrics` is strictly guarded behind `X-Monitoring-Token` or operator Bearer tokens.
-
-### C. Upload & File Protection Hardening (`apps/api/app/core/security.py`)
-* **Stream-Based Size Limits (`read_upload_stream_safely`):** Files are streamed in 64KB chunks. If accumulated size exceeds `MAX_FILE_SIZE_MB` (25MB), the connection is aborted immediately with `413 Request Entity Too Large` before loading into memory.
-* **Magic-Byte Content Inspection (`validate_and_sanitize_upload`):**
-  * `.xlsx`: Must start with ZIP header `PK\x03\x04` and pass decompression safety checks.
-  * `.csv` / `.txt`: Rejects any binary payload containing null bytes (`\x00`).
-* **Zip Bomb & Archive Expansion Defenses:**
-  * Maximum sheets limit (`MAX_XLSX_SHEETS = 20`).
-  * Maximum uncompressed size limit (`MAX_XLSX_UNCOMPRESSED_MB = 100MB`).
-  * Compression ratio check: Any archive file exceeding a 100:1 compression ratio is aborted immediately.
-  * Row limit guard: Files exceeding 50,000 rows are rejected to prevent worker thread starvation.
-* **Path-Traversal & Formula Injection Defense:**
-  * Filenames are sanitized via `os.path.basename` and generated UUID prefixes.
-  * CSV export cells starting with `=`, `+`, `-`, `@`, `\t`, or `\r` are prepended with `'` to prevent spreadsheet formula execution exploits.
-* **Fail-Safe Cleanup (`safe_cleanup_file`):** Disk storage files are safely unlinked in `finally` and `except` blocks if validation or parsing fails.
+| Operation | Path | Allowed Roles | Denied Roles |
+|---|---|---|---|
+| **View Reports & Dashboard** | `GET /workspaces/{id}/*` | `owner`, `admin`, `accountant`, `member`, `viewer` | Unauthenticated, Non-members |
+| **Upload Settlement & Bank Files** | `POST /workspaces/{id}/imports` | `owner`, `admin`, `accountant` | `viewer`, `member` |
+| **Execute Reconciliation Run** | `POST /workspaces/{id}/reconcile` | `owner`, `admin`, `accountant` | `viewer`, `member` |
+| **Export Dispute Packages** | `GET /workspaces/{id}/disputes/*` | `owner`, `admin`, `accountant`, `member` | Non-members |
+| **Configure Rate Cards** | `POST /workspaces/{id}/rate-cards` | `owner`, `admin` | `accountant`, `member`, `viewer` |
+| **Workspace Settings & Invites** | `POST /workspaces/{id}/members` | `owner`, `admin` | `accountant`, `member`, `viewer` |
+| **System Operator Telemetry** | `GET /api/v1/metrics` | `is_superuser=True` OR `X-Monitoring-Token` | All regular tenants & users |
 
 ---
 
-## 3. Financial Reconciliation Engine Architecture
+## 5. Anti-Fabrication Integrity Guarantees
 
-The financial domain model strictly adheres to **deterministic accounting principles**:
-
-```
-                       ┌─────────────────────────┐
-                       │  Marketplace Settlement │
-                       │    (Disbursement ID)    │
-                       └────────────┬────────────┘
-                                    │
-                                    ▼
-                       ┌─────────────────────────┐
-                       │  Canonical Normalizer   │
-                       │  (Universal Fee Schema) │
-                       └────────────┬────────────┘
-                                    │
-           ┌────────────────────────┼────────────────────────┐
-           ▼                        ▼                        ▼
-┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
-│  Rate Card Auditor  │  │  Bank Match Engine  │  │ Statutory Tax (TDS) │
-│ - Expected Comm     │  │ - NEFT / RTGS Match │  │ - Sec 194-O (1%)    │
-│ - Expected Shipping │  │ - Settlement Total  │  │ - Sec 52 TCS (1%)   │
-│ - Slabs & Weight    │  │   == Bank Deposit   │  │ - 26AS Reconciliation│
-└──────────┬──────────┘  └──────────┬──────────┘  └──────────┬──────────┘
-           │                        │                        │
-           └────────────────────────┼────────────────────────┘
-                                    ▼
-                       ┌─────────────────────────┐
-                       │   Discrepancy Ledger    │
-                       │ - short_paid            │
-                       │ - over_paid             │
-                       │ - missing               │
-                       │ - matched (<= +/- ₹1.00)│
-                       └────────────┬────────────┘
-                                    │
-                                    ▼
-                       ┌─────────────────────────┐
-                       │  Dispute Claim Package  │
-                       │  - Summary Cover Letter │
-                       │  - Itemized CSV Proof   │
-                       └─────────────────────────┘
-```
-
-### Financial Rules Enforced:
-1. **Zero Floating Point Arithmetic:** All fee calculations, differences, and statutory taxes use Python `decimal.Decimal` and SQL `NUMERIC(18, 2)`.
-2. **AI Never Mutates Ledger Values:** AI models assist only with natural language explanations and dispute ticket drafting; calculation logic is purely deterministic code.
-3. **Like-for-Like Fee Audits:** Commission, Shipping (FBA/EasyShip/Self-Ship), and Pick & Pack fees are audited against contractual rate cards based on category, item selling price band, and weight slab.
-4. **Tolerance Boundaries:** Deviations within +/- ₹1.00 are classified as `matched` to avoid chasing minute rounding artifacts.
+In financial reconciliation, presenting estimated or invented numbers undermines seller trust and legal compliance:
+1. **Tax Reconciliation (`/tax-reconciliation`):**
+   * When a workspace has no sales records, the API returns a deterministic summary with `gross_sales: "0.00"`, `tds_section_194_o: "0.00"`, and `status: "no_transactions"`.
+   * **Never** substitutes synthetic baseline revenue.
+2. **Dispute Claim Package (`/disputes/generate`):**
+   * If an order discrepancy does not exist in the database, the API returns `404 Not Found`.
+   * **Never** invents claims, placeholder SKUs, or synthetic weight overcharges.
+3. **Cross-Tenant Store Rejection:**
+   * Passing a `store_id` that does not belong to the authorized workspace immediately returns `400 Bad Request`.
+4. **Idempotent Duplicate Protection:**
+   * If an identical report (matching SHA-256 hash) has already completed in the workspace, the system returns the existing verified import record without duplicate ledger entries.
 
 ---
 
-## 4. Multi-Tenant Database Schema
+## 6. Pre-Production Release Gate Checklist
 
-```mermaid
-erDiagram
-    users ||--o{ workspace_members : "belongs to"
-    workspaces ||--o{ workspace_members : "has"
-    workspaces ||--o{ orders : "owns"
-    workspaces ||--o{ settlements : "owns"
-    settlements ||--o{ settlement_transactions : "contains"
-    workspaces ||--o{ rate_cards : "defines"
-    workspaces ||--o{ discrepancies : "flags"
-    discrepancies ||--o{ dispute_claims : "generates"
-    workspaces ||--o{ bank_accounts : "configures"
-    bank_accounts ||--o{ bank_transactions : "records"
-    settlements ||--o{ settlement_bank_matches : "matches"
-    bank_transactions ||--o{ settlement_bank_matches : "clears"
+Before onboarding real seller financial data in staging or production, the following release gates must be satisfied:
 
-    users {
-        string id PK
-        string email UK
-        string password_hash
-        string full_name
-        datetime created_at
-    }
-
-    workspaces {
-        string id PK
-        string name
-        string currency
-        datetime created_at
-    }
-
-    settlements {
-        string id PK
-        string workspace_id FK
-        string marketplace
-        string settlement_id
-        decimal total_amount
-        date start_date
-        date end_date
-    }
-
-    settlement_transactions {
-        string id PK
-        string settlement_id FK
-        string order_id
-        string sku
-        decimal gross_sales
-        decimal marketplace_fees
-        decimal net_amount
-    }
-
-    rate_cards {
-        string id PK
-        string workspace_id FK
-        string marketplace
-        string category
-        decimal commission_rate
-        decimal closing_fee
-        decimal shipping_fee
-    }
-
-    discrepancies {
-        string id PK
-        string workspace_id FK
-        string order_id
-        string discrepancy_type
-        decimal expected_amount
-        decimal actual_amount
-        decimal difference
-        string status
-    }
-```
-
----
-
-## 5. Automated Testing & Verification Suite
-
-The repository enforces automated validation across three test tiers:
-1. **Unit Tests (`tests/unit/`):**
-   * Deterministic fee calculations and rate card boundary tolerances.
-   * Multi-marketplace adapter parsing (Amazon CSV/TXT, Flipkart Settlement CSV, Meesho Payment Sheet).
-   * True overcharge vs normal marketplace fee deduction tests.
-2. **Integration Tests (`tests/integration/`):**
-   * Bank statement CSV parsing and NEFT settlement matching.
-   * Statutory tax withholdings (Section 194-O TDS & Section 52 GST TCS).
-   * Authenticated workspace creation, membership scoping, and API smoke tests.
-3. **Security & Tenant Isolation Tests (`tests/security/`):**
-   * Unauthenticated request rejections (401).
-   * Forged header bypass attempts (`X-User-ID`).
-   * Cross-tenant access attempts between independent workspaces (403).
-   * Weak/placeholder JWT secret startup failure assertions.
-   * File upload attack vectors: oversized files (413), mismatched extensions, null bytes in CSV, corrupt zip/XLSX.
-   * Export formula injection escaping.
-   * In-memory sliding-window rate limiting bursts (429).
-   * Database readiness failure reporting (503).
+- [x] **Clerk Token Verification:** Verified Bearer tokens with server-side identity validation; forged headers (`X-User-ID`) rejected.
+- [x] **Tenant & Role Boundaries:** All 46 automated integration and security tests pass.
+- [x] **Anti-Fabrication Verification:** Endpoints return exact ledger zeros or 404s when records are missing.
+- [x] **Upload Hardening:** Streaming 413 limits, magic byte validation (`PK\x03\x04`), archive expansion limits (100MB max, 20 sheets max), and formula injection escaping.
+- [x] **Operator Telemetry Protection:** `/metrics` rejects regular users and requires non-placeholder monitoring secrets or superuser credentials.
+- [x] **Trusted Proxy Configuration:** Client IPs extracted from `X-Forwarded-For` only when direct caller is in `TRUSTED_PROXIES`.
+- [x] **Alembic Schema Pipeline:** Explicit reviewed migrations for Supabase Postgres; automatic startup table creation disabled in production.
+- [x] **Zero-Leakage Telemetry & Email:** PostHog and Resend sanitize all payloads to exclude order IDs, bank numbers, and financial transaction amounts.

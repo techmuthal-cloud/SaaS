@@ -3,6 +3,7 @@ from typing import List, Optional
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "SellerFlow AI"
+    ENVIRONMENT: str = "development" # development, test, staging, production
     API_V1_PREFIX: str = "/api/v1"
     DATABASE_URL: str = "sqlite:///./sellerflow.db"
     CORS_ORIGINS: List[str] = [
@@ -22,13 +23,38 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
+    # Clerk Authentication Configuration
+    CLERK_SECRET_KEY: Optional[str] = None
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None
+    CLERK_JWKS_URL: Optional[str] = None
+    CLERK_ISSUER: Optional[str] = None
+
     # Internal Monitoring Token for /metrics endpoint
     MONITORING_SECRET_TOKEN: Optional[str] = None
+
+    # Redis for Distributed Rate Limiting & Background Jobs
+    REDIS_URL: Optional[str] = None
+    TRUSTED_PROXIES: List[str] = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
     # Rate limiting thresholds (requests per minute)
     RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
     RATE_LIMIT_REGISTER_PER_MINUTE: int = 5
     RATE_LIMIT_UPLOAD_PER_MINUTE: int = 15
+
+    # Cloudflare R2 / S3 Object Storage
+    R2_ACCOUNT_ID: Optional[str] = None
+    R2_ACCESS_KEY_ID: Optional[str] = None
+    R2_SECRET_ACCESS_KEY: Optional[str] = None
+    R2_BUCKET_NAME: Optional[str] = None
+    R2_ENDPOINT_URL: Optional[str] = None
+
+    # Resend Email Configuration
+    RESEND_API_KEY: Optional[str] = None
+    RESEND_FROM_EMAIL: str = "notifications@sellerflow.ai"
+
+    # PostHog Privacy-Conscious Product Telemetry
+    POSTHOG_API_KEY: Optional[str] = None
+    POSTHOG_HOST: str = "https://app.posthog.com"
 
     class Config:
         case_sensitive = True

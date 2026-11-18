@@ -14,7 +14,7 @@ def test_api_health_endpoint():
     assert "service" in data
 
 def test_api_metrics_endpoint():
-    response = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "sellerflow-monitoring-operator-key"})
+    response = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "sellerflow-test-monitoring-token-2026-xyz"})
     assert response.status_code == 200
     data = response.json()
     assert "workspaces_count" in data

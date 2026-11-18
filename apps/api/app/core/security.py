@@ -74,7 +74,8 @@ def get_current_user(
 ) -> User:
     """
     Enforces validated Bearer JWT authentication.
-    Client-supplied identity headers (such as X-User-ID) are strictly removed and ignored.
+    Supports Clerk tokens when Clerk keys are configured, falling back to local JWT secret.
+    Client-supplied identity headers (such as X-User-ID) are strictly rejected.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -84,24 +85,59 @@ def get_current_user(
         )
 
     token = authorization.split(" ", 1)[1].strip()
-    try:
-        secret = get_jwt_secret()
-        payload = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
-        user_id: str = payload.get("sub")
-        if not user_id:
+    user_id: Optional[str] = None
+    is_clerk_verified = False
+
+    # 1. Check for Clerk token verification if Clerk credentials configured
+    if settings.CLERK_SECRET_KEY:
+        try:
+            clerk_payload = jwt.decode(
+                token,
+                settings.CLERK_SECRET_KEY,
+                algorithms=["HS256", "RS256"],
+                options={"verify_aud": False}
+            )
+            clerk_sub = clerk_payload.get("sub")
+            if clerk_sub:
+                user_id = clerk_sub
+                is_clerk_verified = True
+        except Exception:
+            pass
+
+    # 2. Local JWT secret verification
+    if not user_id:
+        try:
+            secret = get_jwt_secret()
+            payload = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if not user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token payload: missing subject identifier",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        except JWTError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload: missing subject identifier",
+                detail="Invalid or expired authentication credentials",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter((User.id == user_id) | (User.clerk_id == user_id)).first()
+
+    # Auto-provision user record for verified Clerk identities if not in DB yet
+    if not user and is_clerk_verified:
+        user = User(
+            id=user_id,
+            clerk_id=user_id,
+            email=f"{user_id}@clerk.user",
+            full_name="Clerk Verified User",
+            is_active=True
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -149,6 +185,37 @@ def verify_tenant_access(
         )
 
     return workspace
+
+def require_workspace_role(allowed_roles: List[str]):
+    """
+    Role-Based Access Control (RBAC) dependency factory.
+    Verifies that the caller possesses one of the allowed roles (e.g. 'owner', 'admin', 'accountant').
+    """
+    def role_dependency(
+        workspace_id: str,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+    ) -> WorkspaceMember:
+        member = db.query(WorkspaceMember).filter(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_user.id
+        ).first()
+
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: User {current_user.id} is not a member of workspace {workspace_id}"
+            )
+
+        if member.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions: Role '{member.role}' cannot perform this action (requires: {', '.join(allowed_roles)})"
+            )
+
+        return member
+
+    return role_dependency
 
 # ----------------- Security & Sanitization Helpers -----------------
 

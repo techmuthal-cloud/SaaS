@@ -356,7 +356,7 @@ def test_metrics_endpoint_access_control():
     assert fake_res.status_code == 403
 
     # 3. Valid operator monitoring token accepted with 200
-    valid_res = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "sellerflow-monitoring-operator-key"})
+    valid_res = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "sellerflow-test-monitoring-token-2026-xyz"})
     assert valid_res.status_code == 200
     data = valid_res.json()
     assert "workspaces_count" in data
@@ -420,3 +420,126 @@ def test_rate_limiter_throttles_burst_requests():
     assert 429 in responses
     throttled = [code for code in responses if code == 429]
     assert len(throttled) > 0
+
+# ----------------- Production Hardening & Anti-Fabrication Tests -----------------
+
+def test_invalid_store_id_rejected_on_upload():
+    """Verify that passing a store_id not belonging to the workspace returns 400 Bad Request."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"store_test_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Upload with a bogus store_id
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/imports",
+        headers=headers,
+        data={"store_id": "bogus-store-id-999", "marketplace": "amazon_in", "report_type": "settlement"},
+        files={"file": ("test.csv", b"order_id,amount\nOD1,100", "text/csv")}
+    )
+    assert res.status_code == 400
+    assert "does not belong to authorized workspace" in res.json()["detail"]
+
+def test_viewer_role_rejected_from_uploading():
+    """Verify that a workspace member with 'viewer' role is rejected from uploading reports with 403."""
+    db = SessionLocal()
+    try:
+        # Create user with viewer role in workspace
+        viewer_user = User(email=f"viewer_{uuid.uuid4().hex[:6]}@example.com", is_active=True)
+        db.add(viewer_user)
+        ws = Workspace(name="Viewer Test Workspace")
+        db.add(ws)
+        db.commit()
+
+        member = WorkspaceMember(workspace_id=ws.id, user_id=viewer_user.id, role="viewer")
+        db.add(member)
+        db.commit()
+
+        token = create_access_token({"sub": viewer_user.id})
+        headers = {"Authorization": f"Bearer {token}"}
+
+        res = client.post(
+            f"/api/v1/workspaces/{ws.id}/imports",
+            headers=headers,
+            files={"file": ("test.csv", b"order_id,amount\nOD1,100", "text/csv")}
+        )
+        assert res.status_code == 403
+        assert "Viewer role is not authorized" in res.json()["detail"]
+    finally:
+        db.close()
+
+def test_tax_reconciliation_zero_sales_does_not_fabricate_amounts():
+    """Verify tax reconciliation returns 0.00 and no_transactions status, NEVER fabricating 150000.00."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"tax_zero_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.get(f"/api/v1/workspaces/{ws_id}/tax-reconciliation?period_month=2026-11", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["gross_sales"] == "0.00"
+    assert data["tds_section_194_o"] == "0.00"
+    assert data["tcs_section_52"] == "0.00"
+    assert data["status"] == "no_transactions"
+
+def test_dispute_generation_missing_discrepancy_returns_404():
+    """Verify dispute generation fails with 404 when no discrepancy exists, NEVER fabricating 450.00 claim."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"disp_test_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/disputes/generate",
+        headers=headers,
+        json={"order_id": "NON_EXISTENT_ORDER_999", "marketplace": "amazon_in"}
+    )
+    assert res.status_code == 404
+    assert "No discrepancy found" in res.json()["detail"]
+
+def test_metrics_endpoint_rejects_regular_user_bearer_token():
+    """Verify regular authenticated user cannot access /metrics."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"normal_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.get("/api/v1/metrics", headers=headers)
+    assert res.status_code == 403
+    assert "Access denied" in res.json()["detail"]
+
+def test_metrics_endpoint_allows_superuser_bearer_token():
+    """Verify superuser operator CAN access /metrics."""
+    db = SessionLocal()
+    try:
+        super_user = User(email=f"superuser_{uuid.uuid4().hex[:6]}@example.com", is_active=True, is_superuser=True)
+        db.add(super_user)
+        db.commit()
+
+        token = create_access_token({"sub": super_user.id})
+        headers = {"Authorization": f"Bearer {token}"}
+
+        res = client.get("/api/v1/metrics", headers=headers)
+        assert res.status_code == 200
+        assert "workspaces_count" in res.json()
+    finally:
+        db.close()
+
+def test_trusted_proxy_ip_handling():
+    """Verify get_client_ip ignores X-Forwarded-For if direct caller is untrusted."""
+    from app.core.rate_limiter import get_client_ip
+    from unittest.mock import MagicMock
+
+    # Request from untrusted external IP
+    mock_req = MagicMock()
+    mock_req.client.host = "203.0.113.195" # Public internet IP
+    mock_req.headers = {"X-Forwarded-For": "198.51.100.5"}
+
+    ip = get_client_ip(mock_req)
+    assert ip == "203.0.113.195" # Did NOT trust forged header
+
+    # Request from trusted proxy (127.0.0.1)
+    mock_req.client.host = "127.0.0.1"
+    ip_trusted = get_client_ip(mock_req)
+    assert ip_trusted == "198.51.100.5" # Successfully extracted client IP via trusted proxy
+
