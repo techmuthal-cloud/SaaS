@@ -24,7 +24,7 @@ SellerFlow AI is engineered according to **strict financial domain discipline**:
 | **Backend API** | **FastAPI on Container Host** (Render / Fly.io / ECS) | Validates tokens, enforces workspace RBAC, validates uploads, and orchestrates financial engines. |
 | **Database** | **Supabase Managed Postgres** | System of record. Managed relational schemas, row-level constraints, least-privilege roles, and automated PITR backups. |
 | **Schema Migrations** | **Alembic** | Single source of schema truth. Startup `create_all()` is disabled in production; migrations run as a mandatory release step. |
-| **File Storage** | **Cloudflare R2** | Private object storage. Enforces quarantine prefixes, short-lived signed URLs, and automatic purge on validation failure. |
+| **File Storage** | **Supabase Storage** | Private object vault (`sellerflow-vault`). Enforces quarantine prefixes, short-lived signed URLs, and automatic purge on validation failure. |
 | **Distributed Rate Limiting & Jobs** | **Upstash Redis / Managed Redis** | Distributed sliding-window rate limiting and durable queue state across container instances. |
 | **Transactional Email** | **Resend** | Delivers workspace invitations and completion notifications. Never emails bank numbers, PAN/GSTIN, or financial transaction rows. |
 | **Product Telemetry** | **PostHog** | Tracks coarse operational events (`upload_completed`, `reconciliation_run`). Strictly filtered to strip financial numbers and order IDs. |
@@ -66,7 +66,7 @@ flowchart TD
 
     subgraph PersistenceLayer["Storage & Data Tier"]
         DB[(Supabase Postgres\nAlembic Migrations)]
-        R2Storage["Cloudflare R2 Private Bucket\n(Quarantine -> Verified)"]
+        R2Storage["Supabase Storage Private Vault\n(Quarantine -> Verified)"]
         Redis[(Managed Redis Queue)]
         ResendSvc["Resend Email Service\n(Workspace Invites)"]
         PostHogSvc["PostHog Telemetry\n(Anonymized Product Events)"]
