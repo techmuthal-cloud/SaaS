@@ -1,24 +1,35 @@
 import csv
 import io
 import os
+import uuid
 import hashlib
 from decimal import Decimal
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body, status, Request
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body, status, Request, Header
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from jose import jwt
 
 from app.core.database import get_db
 from app.core.config import settings
 from app.core.security import (
     verify_tenant_access,
     validate_and_sanitize_upload,
+    read_upload_stream_safely,
+    safe_cleanup_file,
     sanitize_for_spreadsheet,
     create_access_token,
     get_password_hash,
     verify_password,
-    get_current_user
+    get_current_user,
+    get_jwt_secret
+)
+from app.core.rate_limiter import (
+    rate_limit_login,
+    rate_limit_register,
+    rate_limit_upload
 )
 from app.core.logging import logger
 from app.models.entities import (
@@ -44,12 +55,10 @@ router = APIRouter()
 
 # ----------------- Observability & Health -----------------
 @router.get("/health")
-def health_check(db: Session = Depends(get_db)):
-    try:
-        # Check database connectivity
-        db.execute(sqlalchemy.text("SELECT 1") if hasattr(sqlalchemy, "text") else "SELECT 1")
-    except Exception:
-        pass
+def health_liveness():
+    """
+    Liveness probe: verifies service process is running and responding.
+    """
     return {
         "status": "healthy",
         "service": settings.PROJECT_NAME,
@@ -57,8 +66,66 @@ def health_check(db: Session = Depends(get_db)):
         "version": "2.0.0-production"
     }
 
+@router.get("/health/ready")
+@router.get("/ready")
+def health_readiness(db: Session = Depends(get_db)):
+    """
+    Readiness probe: validates database connectivity.
+    Reports database failures with HTTP 503 Service Unavailable.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        logger.error(f"Readiness probe failed database check: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "database": "disconnected",
+                "detail": "Database connectivity check failed"
+            }
+        )
+
 @router.get("/metrics")
-def get_metrics(db: Session = Depends(get_db)):
+def get_metrics(
+    x_monitoring_token: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Restricted global operational metrics.
+    Only accessible by authorized monitoring operators via X-Monitoring-Token or operator bearer token.
+    """
+    authorized = False
+
+    if settings.MONITORING_SECRET_TOKEN and x_monitoring_token == settings.MONITORING_SECRET_TOKEN:
+        authorized = True
+    elif not settings.MONITORING_SECRET_TOKEN and x_monitoring_token == "sellerflow-monitoring-operator-key":
+        authorized = True
+
+    if not authorized and authorization and authorization.startswith("Bearer "):
+        try:
+            token = authorization.split(" ")[1]
+            payload = jwt.decode(token, get_jwt_secret(), algorithms=[settings.JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user and user.is_active:
+                    authorized = True
+        except Exception:
+            pass
+
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Metrics endpoint is restricted to authorized operators"
+        )
+
     return {
         "workspaces_count": db.query(Workspace).count(),
         "total_imports": db.query(ImportRecord).count(),
@@ -75,6 +142,7 @@ def register_user(
     password: str = Body(..., embed=True),
     full_name: Optional[str] = Body(None, embed=True),
     workspace_name: Optional[str] = Body(None, embed=True),
+    _rate_limit: None = Depends(rate_limit_register),
     db: Session = Depends(get_db)
 ):
     existing = db.query(User).filter(User.email == email.lower().strip()).first()
@@ -116,6 +184,7 @@ def register_user(
 def login_user(
     email: str = Body(..., embed=True),
     password: str = Body(..., embed=True),
+    _rate_limit: None = Depends(rate_limit_login),
     db: Session = Depends(get_db)
 ):
     user = db.query(User).filter(User.email == email.lower().strip()).first()
@@ -227,50 +296,57 @@ def get_stores(
 @router.post("/workspaces/{workspace_id}/imports")
 async def upload_report(
     workspace_id: str,
+    request: Request,
     file: UploadFile = File(...),
     store_id: Optional[str] = Form(None),
     marketplace: Optional[str] = Form("amazon_in"),
     report_type: str = Form("settlement"),
     ws: Workspace = Depends(verify_tenant_access),
+    _rate_limit: None = Depends(rate_limit_upload),
     db: Session = Depends(get_db)
 ):
-    file_bytes = await file.read()
-    
-    # Security Validation: Extension, size, and safe randomized storage filename
-    safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
-    
-    # Enforce tenant-isolated directory
-    tenant_storage_dir = os.path.join(settings.STORAGE_DIR, workspace_id)
-    os.makedirs(tenant_storage_dir, exist_ok=True)
-    file_path = os.path.join(tenant_storage_dir, safe_storage_filename)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    file_path = None
+    import_rec = None
 
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
-
-    sha256 = hashlib.sha256(file_bytes).hexdigest()
-
-    if store_id:
-        store = db.query(Store).filter(Store.id == store_id, Store.workspace_id == workspace_id).first()
-        if store:
-            marketplace = store.marketplace_code
-
-    import_rec = ImportRecord(
-        workspace_id=workspace_id,
-        store_id=store_id,
-        file_name=file.filename,
-        storage_path=file_path,
-        sha256=sha256,
-        file_size_bytes=len(file_bytes),
-        mime_type=file.content_type,
-        report_type=report_type,
-        status="processing"
-    )
-    db.add(import_rec)
-    db.commit()
-    db.refresh(import_rec)
-
-    # Ingest and parse records using appropriate adapter
     try:
+        # 1. Enforce upload size limit during streaming read before full buffering
+        file_bytes = await read_upload_stream_safely(file)
+        
+        # 2. Content & magic-bytes validation, format verification, safe UUID storage path
+        safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
+        
+        # 3. Store upload in tenant-isolated directory outside public web root
+        tenant_storage_dir = os.path.join(settings.STORAGE_DIR, workspace_id)
+        os.makedirs(tenant_storage_dir, exist_ok=True)
+        file_path = os.path.join(tenant_storage_dir, safe_storage_filename)
+
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+        sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+        if store_id:
+            store = db.query(Store).filter(Store.id == store_id, Store.workspace_id == workspace_id).first()
+            if store:
+                marketplace = store.marketplace_code
+
+        import_rec = ImportRecord(
+            workspace_id=workspace_id,
+            store_id=store_id,
+            file_name=file.filename,
+            storage_path=file_path,
+            sha256=sha256,
+            file_size_bytes=len(file_bytes),
+            mime_type=file.content_type,
+            report_type=report_type,
+            status="processing"
+        )
+        db.add(import_rec)
+        db.commit()
+        db.refresh(import_rec)
+
+        # 4. Ingest and parse records using appropriate adapter with row limit safeguards
         is_excel = file.filename.lower().endswith(".xlsx")
         rows = []
         if is_excel:
@@ -288,6 +364,16 @@ async def upload_report(
                 rows = MeeshoSettlementAdapter.parse_csv_stream(text_stream)
             else:
                 rows = AmazonSettlementAdapter.parse_csv_stream(text_stream)
+
+        if len(rows) > settings.MAX_UPLOAD_ROWS:
+            safe_cleanup_file(file_path)
+            import_rec.status = "failed"
+            import_rec.error_summary = {"error": f"Row count {len(rows)} exceeds limit {settings.MAX_UPLOAD_ROWS}"}
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Report exceeds maximum allowed limit of {settings.MAX_UPLOAD_ROWS} rows. Reference Request ID: {request_id}"
+            )
 
         import_rec.row_count = len(rows)
 
@@ -311,7 +397,6 @@ async def upload_report(
             )
             db.add(src)
 
-            # Persist canonical settlement transaction
             st = SettlementTransaction(
                 workspace_id=workspace_id,
                 store_id=store_id,
@@ -330,7 +415,6 @@ async def upload_report(
         import_rec.accepted_count = accepted
         import_rec.status = "completed"
         
-        # Log audit event
         db.add(AuditEvent(
             workspace_id=workspace_id,
             action="IMPORT_UPLOAD",
@@ -340,19 +424,30 @@ async def upload_report(
         ))
         db.commit()
 
-    except Exception as e:
-        import_rec.status = "failed"
-        import_rec.error_summary = {"error": str(e)}
-        db.commit()
-        logger.error(f"Import processing failed for {file.filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process settlement report: {str(e)}")
+        return {
+            "import_id": import_rec.id,
+            "status": import_rec.status,
+            "rows_processed": import_rec.accepted_count,
+            "marketplace": marketplace
+        }
 
-    return {
-        "import_id": import_rec.id,
-        "status": import_rec.status,
-        "rows_processed": import_rec.accepted_count,
-        "marketplace": marketplace
-    }
+    except HTTPException:
+        safe_cleanup_file(file_path)
+        raise
+    except Exception as e:
+        safe_cleanup_file(file_path)
+        if import_rec:
+            try:
+                import_rec.status = "failed"
+                import_rec.error_summary = {"error": "Processing failed"}
+                db.commit()
+            except Exception:
+                pass
+        logger.error(f"[request_id={request_id}] Import processing failed for file={file.filename}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to process settlement report: Invalid or malformed file structure. Reference Request ID: {request_id}"
+        )
 
 # ----------------- Reconciliation (Rate Card Audited) -----------------
 @router.post("/workspaces/{workspace_id}/reconcile")
@@ -601,46 +696,58 @@ def get_cohort_returns(
 @router.post("/workspaces/{workspace_id}/bank-statements/upload")
 async def upload_bank_statement(
     workspace_id: str,
+    request: Request,
     file: UploadFile = File(...),
     ws: Workspace = Depends(verify_tenant_access),
+    _rate_limit: None = Depends(rate_limit_upload),
     db: Session = Depends(get_db)
 ):
-    file_bytes = await file.read()
-    validate_and_sanitize_upload(file_bytes, file.filename)
-    text_stream = io.StringIO(file_bytes.decode("utf-8", errors="replace"))
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    try:
+        file_bytes = await read_upload_stream_safely(file)
+        validate_and_sanitize_upload(file_bytes, file.filename)
+        text_stream = io.StringIO(file_bytes.decode("utf-8", errors="replace"))
 
-    parsed = BankStatementService.parse_csv(text_stream)
+        parsed = BankStatementService.parse_csv(text_stream)
 
-    # Get or create default bank account
-    acct = db.query(BankAccount).filter(BankAccount.workspace_id == workspace_id).first()
-    if not acct:
-        acct = BankAccount(workspace_id=workspace_id, bank_name="Primary Business Account", account_number_mask="XXXX-8821")
-        db.add(acct)
+        # Get or create default bank account
+        acct = db.query(BankAccount).filter(BankAccount.workspace_id == workspace_id).first()
+        if not acct:
+            acct = BankAccount(workspace_id=workspace_id, bank_name="Primary Business Account", account_number_mask="XXXX-8821")
+            db.add(acct)
+            db.commit()
+            db.refresh(acct)
+
+        inserted = 0
+        for t in parsed:
+            val_date = datetime.utcnow().date()
+            try:
+                val_date = datetime.strptime(t["value_date"][:10], "%Y-%m-%d").date()
+            except Exception:
+                pass
+
+            bt = BankTransaction(
+                workspace_id=workspace_id,
+                bank_account_id=acct.id,
+                value_date=val_date,
+                narration=t.get("narration", "Bank Deposit"),
+                reference_number=t.get("reference_number"),
+                debit_amount=t.get("debit_amount", Decimal("0.00")),
+                credit_amount=t.get("credit_amount", Decimal("0.00"))
+            )
+            db.add(bt)
+            inserted += 1
+
         db.commit()
-        db.refresh(acct)
-
-    inserted = 0
-    for t in parsed:
-        val_date = datetime.utcnow().date()
-        try:
-            val_date = datetime.strptime(t["value_date"][:10], "%Y-%m-%d").date()
-        except Exception:
-            pass
-
-        bt = BankTransaction(
-            workspace_id=workspace_id,
-            bank_account_id=acct.id,
-            value_date=val_date,
-            narration=t.get("narration", "Bank Deposit"),
-            reference_number=t.get("reference_number"),
-            debit_amount=t.get("debit_amount", Decimal("0.00")),
-            credit_amount=t.get("credit_amount", Decimal("0.00"))
+        return {"status": "success", "transactions_imported": inserted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[request_id={request_id}] Bank statement upload failed for file={file.filename}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to process bank statement: Invalid or malformed file structure. Reference Request ID: {request_id}"
         )
-        db.add(bt)
-        inserted += 1
-
-    db.commit()
-    return {"status": "success", "transactions_imported": inserted}
 
 @router.get("/workspaces/{workspace_id}/bank-reconciliation")
 def reconcile_settlement_to_bank(

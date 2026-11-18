@@ -243,3 +243,180 @@ def test_unsupported_file_extension_rejected():
         validate_and_sanitize_upload(b"malicious executable", "payload.exe")
     assert exc_info.value.status_code == 400
     assert "Unsupported file format" in exc_info.value.detail
+
+# ----------------- Part 2: Upload Hardening & Content Validation Tests -----------------
+
+def test_mismatched_xlsx_content_rejected():
+    """An XLSX file without PK zip magic bytes must be rejected with 400."""
+    with pytest.raises(HTTPException) as exc_info:
+        validate_and_sanitize_upload(b"Plain text data instead of zip archive", "fake.xlsx")
+    assert exc_info.value.status_code == 400
+    assert "Missing valid Zip archive signature" in exc_info.value.detail
+
+def test_binary_content_in_csv_rejected():
+    """A CSV file with binary null bytes must be rejected with 400."""
+    with pytest.raises(HTTPException) as exc_info:
+        validate_and_sanitize_upload(b"order_id,amount\x00\x01\x02binarypayload", "fake.csv")
+    assert exc_info.value.status_code == 400
+    assert "Binary null bytes detected" in exc_info.value.detail
+
+def test_malformed_xlsx_corrupted_zip_rejected():
+    """A corrupted zip archive with .xlsx extension must be rejected with 400."""
+    corrupt_zip = b"PK\x03\x04" + b"invalid_corrupted_payload" * 10
+    with pytest.raises(HTTPException) as exc_info:
+        validate_and_sanitize_upload(corrupt_zip, "corrupt.xlsx")
+    assert exc_info.value.status_code == 400
+    assert "Corrupted or unreadable Zip archive structure" in exc_info.value.detail
+
+def test_oversized_file_upload_rejected():
+    """Enforce size limits while reading before full buffering."""
+    # Register user
+    email = f"uploader_{uuid.uuid4().hex[:6]}@example.com"
+    reg = client.post("/api/v1/auth/register", json={"email": email, "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Generate content larger than 25MB (26MB)
+    oversized_bytes = b"0" * (26 * 1024 * 1024)
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/imports",
+        headers=headers,
+        files={"file": ("huge_file.csv", oversized_bytes, "text/csv")}
+    )
+    assert res.status_code == 413
+    assert "exceeds maximum allowed size limit" in res.json()["detail"]
+
+def test_failed_upload_cleans_up_storage_file():
+    """Verify that when an upload fails validation or parsing, no orphan file remains on disk."""
+    import os
+    from app.core.config import settings
+
+    email = f"clean_{uuid.uuid4().hex[:6]}@example.com"
+    reg = client.post("/api/v1/auth/register", json={"email": email, "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Upload mismatched file
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/imports",
+        headers=headers,
+        files={"file": ("corrupt.xlsx", b"not-a-valid-zip-file", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+    )
+    assert res.status_code == 400
+
+    # Verify no orphan files left in workspace upload directory
+    ws_dir = os.path.join(settings.STORAGE_DIR, ws_id)
+    if os.path.exists(ws_dir):
+        files_in_dir = os.listdir(ws_dir)
+        assert len(files_in_dir) == 0, f"Expected 0 files after cleanup, found {files_in_dir}"
+
+# ----------------- Part 2: Readiness & Restricted Metrics Tests -----------------
+
+def test_readiness_probe_database_success():
+    """Readiness probe returns 200 when database connectivity is operational."""
+    res = client.get("/api/v1/health/ready")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert data["database"] == "connected"
+
+def test_readiness_probe_reports_database_failure():
+    """Readiness probe returns 503 Service Unavailable when database fails."""
+    from app.main import app
+    from app.core.database import get_db
+
+    # Mock broken database session
+    def broken_db():
+        class BrokenSession:
+            def execute(self, *args, **kwargs):
+                raise RuntimeError("Database connection pool exhausted")
+        yield BrokenSession()
+
+    app.dependency_overrides[get_db] = broken_db
+    try:
+        res = client.get("/api/v1/health/ready")
+        assert res.status_code == 503
+        data = res.json()
+        assert data["status"] == "unhealthy"
+        assert data["database"] == "disconnected"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+def test_metrics_endpoint_access_control():
+    """Metrics endpoint must be restricted to authorized operators."""
+    # 1. Unauthenticated request without monitoring token must be rejected with 403
+    unauth_res = client.get("/api/v1/metrics")
+    assert unauth_res.status_code == 403
+    assert "restricted to authorized operators" in unauth_res.json()["detail"]
+
+    # 2. Invalid monitoring token rejected with 403
+    fake_res = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "invalid-token"})
+    assert fake_res.status_code == 403
+
+    # 3. Valid operator monitoring token accepted with 200
+    valid_res = client.get("/api/v1/metrics", headers={"X-Monitoring-Token": "sellerflow-monitoring-operator-key"})
+    assert valid_res.status_code == 200
+    data = valid_res.json()
+    assert "workspaces_count" in data
+    assert "total_imports" in data
+
+# ----------------- Part 2: Tenant-Scoped Uploads & Exports -----------------
+
+def test_tenant_scoped_upload_access_denied():
+    """User A cannot upload files into User B's workspace."""
+    # Register User A
+    reg_a = client.post("/api/v1/auth/register", json={"email": f"a_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token_a = reg_a.json()["access_token"]
+    headers_a = {"Authorization": f"Bearer {token_a}"}
+
+    # Register User B
+    reg_b = client.post("/api/v1/auth/register", json={"email": f"b_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    ws_b_id = reg_b.json()["workspace"]["id"]
+
+    # User A tries to upload to User B's workspace -> MUST BE 403
+    res = client.post(
+        f"/api/v1/workspaces/{ws_b_id}/imports",
+        headers=headers_a,
+        files={"file": ("test.csv", b"order_id,amount\nOD1,100", "text/csv")}
+    )
+    assert res.status_code == 403
+    assert "Access denied" in res.json()["detail"]
+
+def test_tenant_scoped_export_access_denied():
+    """User A cannot export User B's dispute manifest or Tally XML."""
+    reg_a = client.post("/api/v1/auth/register", json={"email": f"ea_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token_a = reg_a.json()["access_token"]
+    headers_a = {"Authorization": f"Bearer {token_a}"}
+
+    reg_b = client.post("/api/v1/auth/register", json={"email": f"eb_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    ws_b_id = reg_b.json()["workspace"]["id"]
+
+    # User A attempts to export User B's batch dispute manifest
+    res1 = client.get(f"/api/v1/workspaces/{ws_b_id}/discrepancies/batch-manifest", headers=headers_a)
+    assert res1.status_code == 403
+    assert "Access denied" in res1.json()["detail"]
+
+    # User A attempts to export User B's Tally DayBook XML
+    res2 = client.get(f"/api/v1/workspaces/{ws_b_id}/export-tally", headers=headers_a)
+    assert res2.status_code == 403
+    assert "Access denied" in res2.json()["detail"]
+
+# ----------------- Part 2: Rate Limiting Tests -----------------
+
+def test_rate_limiter_throttles_burst_requests():
+    """Verify in-memory sliding-window rate limiter blocks brute-force abuse with 429."""
+    from app.core.rate_limiter import limiter
+    limiter.reset()
+
+    # Perform rapid login attempts
+    responses = []
+    for _ in range(15):
+        r = client.post("/api/v1/auth/login", json={"email": "nonexistent@example.com", "password": "wrong"})
+        responses.append(r.status_code)
+
+    # First 10 attempts allowed (401 invalid creds), subsequent attempts throttled with 429
+    assert 429 in responses
+    throttled = [code for code in responses if code == 429]
+    assert len(throttled) > 0

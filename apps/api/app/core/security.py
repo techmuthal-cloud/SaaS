@@ -1,16 +1,19 @@
 import os
+import io
 import uuid
 import re
-from datetime import datetime, timedelta
-from typing import Optional, List
-from fastapi import Header, HTTPException, status, Depends
+import zipfile
 import bcrypt
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+from fastapi import Header, HTTPException, status, Depends, UploadFile
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.entities import User, Workspace, WorkspaceMember
+from app.core.logging import logger
 
 KNOWN_INSECURE_PLACEHOLDERS = {
     "sellerflow-dev-secret-key-change-in-production-2026",
@@ -150,9 +153,9 @@ def verify_tenant_access(
 # ----------------- Security & Sanitization Helpers -----------------
 
 ALLOWED_EXTENSIONS = {".csv", ".tsv", ".txt", ".xlsx"}
-MAGIC_BYTES_PREFIXES = {
-    b"PK\x03\x04": ".xlsx", # Zip/Excel
-}
+MAGIC_BYTES_ZIP = b"PK\x03\x04"
+MAGIC_BYTES_EXE = b"MZ"
+MAGIC_BYTES_ELF = b"\x7fELF"
 
 def sanitize_for_spreadsheet(value: Optional[str]) -> str:
     """
@@ -167,25 +170,116 @@ def sanitize_for_spreadsheet(value: Optional[str]) -> str:
         return f"'{str_val}"
     return str_val
 
+async def read_upload_stream_safely(
+    file: UploadFile,
+    max_bytes: int = settings.MAX_FILE_SIZE_MB * 1024 * 1024,
+    chunk_size: int = 64 * 1024
+) -> bytes:
+    """
+    Streams upload chunks into memory with strict size limit enforcement during reading,
+    preventing denial-of-service through memory exhaustion.
+    """
+    total_bytes = 0
+    buffer = bytearray()
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds maximum allowed size limit of {settings.MAX_FILE_SIZE_MB}MB"
+            )
+        buffer.extend(chunk)
+
+    return bytes(buffer)
+
 def validate_and_sanitize_upload(file_bytes: bytes, filename: str) -> str:
     """
-    Validates file extension, size, and returns a secure random UUID-based storage filename.
-    Never trusts client-provided file paths.
+    Validates file extension, magic bytes, text/zip integrity, and returns a secure random UUID storage name.
+    Neutralizes path traversal attempts.
     """
-    if len(file_bytes) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File exceeds maximum allowed size of {settings.MAX_FILE_SIZE_MB}MB"
-        )
+    if not filename or not filename.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File name cannot be empty")
 
-    # Check extension
-    _, ext = os.path.splitext(filename.lower())
+    _, ext = os.path.splitext(filename.lower().strip())
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file format: {ext}. Allowed formats: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file format: {ext}. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
+
+    # Empty file check
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty (0 bytes)")
+
+    # Content & Magic-Byte Validation
+    if ext == ".xlsx":
+        if not file_bytes.startswith(MAGIC_BYTES_ZIP):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid XLSX file: Missing valid Zip archive signature (mismatched extension)"
+            )
+        # Validate Zip structure and check against decompression bombs
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
+                info_list = zf.infolist()
+                sheet_count = sum(1 for item in info_list if "xl/worksheets/sheet" in item.filename)
+                if sheet_count > settings.MAX_XLSX_SHEETS:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"XLSX file exceeds maximum allowed sheet count ({settings.MAX_XLSX_SHEETS})"
+                    )
+
+                total_uncompressed = 0
+                max_uncompressed = settings.MAX_XLSX_UNCOMPRESSED_MB * 1024 * 1024
+                for item in info_list:
+                    total_uncompressed += item.file_size
+                    if total_uncompressed > max_uncompressed:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="XLSX expansion size exceeds maximum allowed decompression limit"
+                        )
+                    # Check suspicious compression ratio
+                    if item.compress_size > 0 and (item.file_size / item.compress_size) > 100:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Suspicious archive compression ratio detected"
+                        )
+        except zipfile.BadZipFile:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid XLSX file: Corrupted or unreadable Zip archive structure"
+            )
+    else:
+        # CSV / TSV / TXT
+        # Reject binary executables disguised as text
+        if file_bytes.startswith(MAGIC_BYTES_ZIP) or file_bytes.startswith(MAGIC_BYTES_EXE) or file_bytes.startswith(MAGIC_BYTES_ELF):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid text report: Binary file signature detected"
+            )
+        # Check first 4KB for null bytes indicating binary content
+        sample = file_bytes[:4096]
+        if b"\x00" in sample:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid report content: Binary null bytes detected in text file"
+            )
 
     # Safe random filename on disk (avoids path traversal entirely)
     safe_storage_name = f"{uuid.uuid4().hex}{ext}"
     return safe_storage_name
+
+def safe_cleanup_file(file_path: Optional[str]):
+    """
+    Safely cleans up temporary or aborted upload files on disk.
+    """
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            logger.info(f"Cleaned up temporary upload file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to remove upload file {file_path}: {e}")
