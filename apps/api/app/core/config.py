@@ -23,11 +23,18 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
-    # Clerk Authentication Configuration
+    # Clerk Authentication Configuration (Loaded from environment variables)
     CLERK_SECRET_KEY: Optional[str] = None
     CLERK_PUBLISHABLE_KEY: Optional[str] = None
     CLERK_JWKS_URL: Optional[str] = None
     CLERK_ISSUER: Optional[str] = None
+
+    # Supabase Platform (Database & Storage - Loaded from environment variables)
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_STORAGE_BUCKET: str = "sellerflow-vault"
+    STORAGE_PROVIDER: str = "supabase" # supabase, local
 
     # Internal Monitoring Token for /metrics endpoint
     MONITORING_SECRET_TOKEN: Optional[str] = None
@@ -40,13 +47,6 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
     RATE_LIMIT_REGISTER_PER_MINUTE: int = 5
     RATE_LIMIT_UPLOAD_PER_MINUTE: int = 15
-
-    # Cloudflare R2 / S3 Object Storage
-    R2_ACCOUNT_ID: Optional[str] = None
-    R2_ACCESS_KEY_ID: Optional[str] = None
-    R2_SECRET_ACCESS_KEY: Optional[str] = None
-    R2_BUCKET_NAME: Optional[str] = None
-    R2_ENDPOINT_URL: Optional[str] = None
 
     # Resend Email Configuration
     RESEND_API_KEY: Optional[str] = None

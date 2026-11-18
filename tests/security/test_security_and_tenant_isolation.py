@@ -543,3 +543,50 @@ def test_trusted_proxy_ip_handling():
     ip_trusted = get_client_ip(mock_req)
     assert ip_trusted == "198.51.100.5" # Successfully extracted client IP via trusted proxy
 
+def test_viewer_role_rejected_from_reconcile_and_tally_export():
+    """Verify viewer role cannot trigger reconciliation or export Tally daybook."""
+    db = SessionLocal()
+    try:
+        viewer_user = User(email=f"viewer_audit_{uuid.uuid4().hex[:6]}@example.com", is_active=True)
+        db.add(viewer_user)
+        ws = Workspace(name="Viewer RBAC Test Workspace")
+        db.add(ws)
+        db.commit()
+
+        member = WorkspaceMember(workspace_id=ws.id, user_id=viewer_user.id, role="viewer")
+        db.add(member)
+        db.commit()
+
+        token = create_access_token({"sub": viewer_user.id})
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Attempt to run reconciliation
+        recon_res = client.post(f"/api/v1/workspaces/{ws.id}/reconcile", headers=headers)
+        assert recon_res.status_code == 403
+        assert "Reconciliation execution requires" in recon_res.json()["detail"]
+
+        # Attempt to export Tally DayBook
+        tally_res = client.get(f"/api/v1/workspaces/{ws.id}/export-tally", headers=headers)
+        assert tally_res.status_code == 403
+        assert "Tally export requires" in tally_res.json()["detail"]
+    finally:
+        db.close()
+
+def test_storage_provider_quarantine_workflow():
+    """Verify storage provider saves in quarantine and promotes to verified."""
+    from app.core.storage import storage
+    test_ws = f"ws_test_{uuid.uuid4().hex[:6]}"
+    test_file = "test_doc.csv"
+    data = b"order_id,amount\n101,500.00"
+
+    path = storage.save(test_ws, test_file, data, is_quarantined=True)
+    assert "quarantine" in path
+
+    verified_path = storage.promote_from_quarantine(path)
+    assert "verified" in verified_path
+
+    # Clean up
+    deleted = storage.delete(verified_path)
+    assert deleted is True
+
+

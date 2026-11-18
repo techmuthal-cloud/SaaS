@@ -1,4 +1,7 @@
 import os
+import json
+import urllib.request
+import urllib.error
 import io
 import uuid
 import re
@@ -68,13 +71,89 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, secret, algorithm=settings.JWT_ALGORITHM)
 
+_CLERK_JWKS_CACHE = None
+
+def get_clerk_jwks():
+    global _CLERK_JWKS_CACHE
+    if _CLERK_JWKS_CACHE is None and settings.CLERK_JWKS_URL:
+        try:
+            req = urllib.request.Request(settings.CLERK_JWKS_URL, headers={"User-Agent": "SellerFlow-Backend"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                _CLERK_JWKS_CACHE = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Could not load Clerk JWKS: {e}")
+    return _CLERK_JWKS_CACHE
+
+def verify_clerk_token_jwks(token: str) -> Optional[dict]:
+    """
+    Verifies Clerk RS256 token against Clerk JWKS validating issuer and subject.
+    """
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+        jwks = get_clerk_jwks()
+        
+        rsa_key = {}
+        if jwks and "keys" in jwks:
+            for key in jwks["keys"]:
+                if key.get("kid") == kid:
+                    rsa_key = key
+                    break
+
+        if rsa_key:
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=["RS256"],
+                issuer=settings.CLERK_ISSUER,
+                options={"verify_aud": False}
+            )
+            return payload
+    except Exception as e:
+        logger.debug(f"Clerk JWKS token verification failed: {e}")
+        
+    if settings.CLERK_SECRET_KEY:
+        try:
+            payload = jwt.decode(
+                token,
+                settings.CLERK_SECRET_KEY,
+                algorithms=["HS256", "RS256"],
+                options={"verify_aud": False}
+            )
+            return payload
+        except Exception:
+            pass
+
+    return None
+
+def fetch_clerk_user_email(clerk_user_id: str) -> Optional[str]:
+    """
+    Fetches real verified primary email address for user from Clerk Backend API.
+    """
+    if not settings.CLERK_SECRET_KEY:
+        return None
+    try:
+        url = f"https://api.clerk.com/v1/users/{clerk_user_id}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            emails = data.get("email_addresses", [])
+            for e in emails:
+                if e.get("id") == data.get("primary_email_address_id"):
+                    return e.get("email_address")
+            if emails:
+                return emails[0].get("email_address")
+    except Exception:
+        pass
+    return None
+
 def get_current_user(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ) -> User:
     """
     Enforces validated Bearer JWT authentication.
-    Supports Clerk tokens when Clerk keys are configured, falling back to local JWT secret.
+    Verifies Clerk RS256 JWKS tokens in production; supports local JWT secret in test/dev.
     Client-supplied identity headers (such as X-User-ID) are strictly rejected.
     """
     if not authorization or not authorization.startswith("Bearer "):
@@ -88,24 +167,20 @@ def get_current_user(
     user_id: Optional[str] = None
     is_clerk_verified = False
 
-    # 1. Check for Clerk token verification if Clerk credentials configured
-    if settings.CLERK_SECRET_KEY:
-        try:
-            clerk_payload = jwt.decode(
-                token,
-                settings.CLERK_SECRET_KEY,
-                algorithms=["HS256", "RS256"],
-                options={"verify_aud": False}
-            )
-            clerk_sub = clerk_payload.get("sub")
-            if clerk_sub:
-                user_id = clerk_sub
-                is_clerk_verified = True
-        except Exception:
-            pass
+    # 1. First attempt verification with Clerk JWKS
+    clerk_payload = verify_clerk_token_jwks(token)
+    if clerk_payload:
+        user_id = clerk_payload.get("sub")
+        is_clerk_verified = True
 
-    # 2. Local JWT secret verification
+    # 2. Local JWT secret verification allowed only in non-production environments
     if not user_id:
+        if settings.ENVIRONMENT == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Clerk authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         try:
             secret = get_jwt_secret()
             payload = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
@@ -125,12 +200,13 @@ def get_current_user(
 
     user = db.query(User).filter((User.id == user_id) | (User.clerk_id == user_id)).first()
 
-    # Auto-provision user record for verified Clerk identities if not in DB yet
+    # Provision user record from real Clerk profile
     if not user and is_clerk_verified:
+        verified_email = fetch_clerk_user_email(user_id) or f"clerk_{user_id}@clerk.user"
         user = User(
             id=user_id,
             clerk_id=user_id,
-            email=f"{user_id}@clerk.user",
+            email=verified_email,
             full_name="Clerk Verified User",
             is_active=True
         )

@@ -349,13 +349,8 @@ async def upload_report(
         # 2. Content & magic-bytes validation, format verification, safe UUID storage path
         safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
         
-        # 3. Store upload in isolated storage
-        tenant_storage_dir = os.path.join(settings.STORAGE_DIR, workspace_id)
-        os.makedirs(tenant_storage_dir, exist_ok=True)
-        file_path = os.path.join(tenant_storage_dir, safe_storage_filename)
-
-        with open(file_path, "wb") as f:
-            f.write(file_bytes)
+        # 3. Store upload in Supabase Storage quarantine
+        file_path = storage.save(workspace_id, safe_storage_filename, file_bytes, is_quarantined=True)
 
         sha256 = hashlib.sha256(file_bytes).hexdigest()
 
@@ -463,6 +458,10 @@ async def upload_report(
             resource_id=import_rec.id,
             details={"file_name": file.filename, "rows": len(rows), "marketplace": marketplace}
         ))
+        
+        # Promote storage file from quarantine to verified
+        verified_path = storage.promote_from_quarantine(file_path)
+        import_rec.storage_path = verified_path
         db.commit()
 
         # Telemetry: coarse product metric, strictly zero financial/order details
@@ -480,10 +479,14 @@ async def upload_report(
         }
 
     except HTTPException:
-        safe_cleanup_file(file_path)
+        if file_path:
+            storage.delete(file_path)
+            safe_cleanup_file(file_path)
         raise
     except Exception as e:
-        safe_cleanup_file(file_path)
+        if file_path:
+            storage.delete(file_path)
+            safe_cleanup_file(file_path)
         if import_rec:
             try:
                 import_rec.status = "failed"
@@ -534,8 +537,18 @@ def run_reconciliation(
     store_id: Optional[str] = Query(None),
     marketplace: Optional[str] = Query("amazon_in"),
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Reconciliation execution requires owner, admin, or accountant role"
+        )
     orders_q = db.query(OrderRecord).filter(OrderRecord.workspace_id == workspace_id)
     if store_id:
         orders_q = orders_q.filter(OrderRecord.store_id == store_id)
@@ -624,8 +637,19 @@ def get_discrepancies(
 def export_batch_manifest(
     workspace_id: str,
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant", "member"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Manifest export requires owner, admin, accountant, or member role"
+        )
+
     discs = db.query(Discrepancy).filter(
         Discrepancy.workspace_id == workspace_id
     ).all()
@@ -657,8 +681,18 @@ def generate_dispute(
     order_id: str = Body(..., embed=True),
     marketplace: str = Body("amazon_in", embed=True),
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant", "member"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Dispute generation requires owner, admin, accountant, or member role"
+        )
     disc = db.query(Discrepancy).filter(
         Discrepancy.workspace_id == workspace_id,
         Discrepancy.external_order_id == order_id
@@ -795,13 +829,26 @@ async def upload_bank_statement(
     request: Request,
     file: UploadFile = File(...),
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     _rate_limit: None = Depends(rate_limit_upload),
     db: Session = Depends(get_db)
 ):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Bank statement uploads require owner, admin, or accountant role"
+        )
+
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    file_path = None
     try:
         file_bytes = await read_upload_stream_safely(file)
-        validate_and_sanitize_upload(file_bytes, file.filename)
+        safe_filename = validate_and_sanitize_upload(file_bytes, file.filename)
+        file_path = storage.save(workspace_id, safe_filename, file_bytes, is_quarantined=False)
         text_stream = io.StringIO(file_bytes.decode("utf-8", errors="replace"))
 
         parsed = BankStatementService.parse_csv(text_stream)
@@ -914,8 +961,19 @@ def get_tax_reconciliation(
 def export_tally_daybook(
     workspace_id: str,
     ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Tally export requires owner, admin, or accountant role"
+        )
+
     xml_content = TallyExporterService.generate_daybook_xml(workspace_id=workspace_id, db=db)
     response = Response(content=xml_content, media_type="application/xml")
     response.headers["Content-Disposition"] = "attachment; filename=SellerFlow_Tally_DayBook.xml"

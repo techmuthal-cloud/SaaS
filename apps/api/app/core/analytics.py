@@ -1,21 +1,35 @@
 import logging
+import hashlib
 from typing import Dict, Any, Optional
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Sensitive keywords that must NEVER be ingested into telemetry
-PROHIBITED_METRIC_KEYS = {
-    "order_id", "external_order_id", "sku", "amount", "gross_amount", "net_amount",
-    "fee", "commission", "difference_amount", "bank_account", "account_number",
-    "pan", "gstin", "customer_name", "phone", "email", "secret", "password"
+# Strict allowlists: Zero financial numbers, order IDs, SKUs, or customer PII can ever pass through
+ALLOWED_EVENTS = {
+    "workspace_created",
+    "import_started",
+    "import_completed",
+    "reconciliation_started",
+    "reconciliation_completed",
+    "dispute_manifest_exported",
+    "tally_exported"
+}
+
+ALLOWED_PROPERTIES = {
+    "environment",
+    "status",
+    "marketplace",
+    "rows_count",
+    "discrepancy_count",
+    "duration_seconds"
 }
 
 class TelemetryService:
     """
-    Privacy-conscious product analytics integration via PostHog.
-    Guarantees that zero financial ledger data, order identifiers, or PII
-    are transmitted to telemetry servers.
+    Privacy-First Product Telemetry via PostHog.
+    Uses strict allowlists for event names and properties.
+    Pseudonymizes all workspace/user identifiers using one-way SHA-256 hashes.
     """
     _posthog_client = None
 
@@ -38,28 +52,28 @@ class TelemetryService:
         event_name: str,
         properties: Optional[Dict[str, Any]] = None
     ):
-        """
-        Captures sanitized high-level product actions (e.g. 'file_upload_succeeded').
-        All properties are strictly sanitized to drop any financial/order data.
-        """
+        if event_name not in ALLOWED_EVENTS:
+            logger.debug(f"Telemetry rejected unapproved event name: {event_name}")
+            return
+
+        # Pseudonymize distinct_id with truncated SHA-256 hash
+        pseudonymous_id = hashlib.sha256(str(distinct_id).encode("utf-8")).hexdigest()[:16]
+
         sanitized_props: Dict[str, Any] = {
             "environment": settings.ENVIRONMENT
         }
 
         if properties:
             for k, v in properties.items():
-                lower_k = k.lower()
-                if any(bad in lower_k for bad in PROHIBITED_METRIC_KEYS):
-                    continue
-                # Only allow basic types
-                if isinstance(v, (str, int, float, bool)):
-                    sanitized_props[k] = v
+                if k in ALLOWED_PROPERTIES:
+                    if isinstance(v, (str, int, float, bool)):
+                        sanitized_props[k] = v
 
         client = cls.get_client()
         if client:
             try:
-                client.capture(distinct_id=distinct_id, event=event_name, properties=sanitized_props)
+                client.capture(distinct_id=pseudonymous_id, event=event_name, properties=sanitized_props)
             except Exception as e:
                 logger.debug(f"Telemetry capture error: {e}")
         else:
-            logger.debug(f"[Telemetry Mock] {distinct_id} -> {event_name}: {sanitized_props}")
+            logger.debug(f"[Telemetry Mock] {pseudonymous_id} -> {event_name}: {sanitized_props}")

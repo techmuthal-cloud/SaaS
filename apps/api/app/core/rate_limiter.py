@@ -1,4 +1,5 @@
 import time
+import uuid
 import threading
 import ipaddress
 from collections import defaultdict
@@ -9,7 +10,7 @@ from app.core.config import settings
 class InMemoryRateLimiter:
     """
     Thread-safe sliding-window in-memory rate limiter.
-    Used for local development and test suites.
+    Used for local development and offline test suites.
     """
     def __init__(self):
         self._lock = threading.Lock()
@@ -35,40 +36,73 @@ class InMemoryRateLimiter:
         with self._lock:
             self._records.clear()
 
+LUA_SLIDING_WINDOW_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local cutoff = tonumber(ARGV[2])
+local max_requests = tonumber(ARGV[3])
+local window = tonumber(ARGV[4])
+local member = ARGV[5]
+
+redis.call('ZREMRANGEBYSCORE', key, 0, cutoff)
+local count = redis.call('ZCARD', key)
+if count >= max_requests then
+    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    local retry_after = 1
+    if oldest and #oldest > 1 then
+        retry_after = math.max(1, math.ceil(window - (now - tonumber(oldest[2]))))
+    end
+    return retry_after
+else
+    redis.call('ZADD', key, now, member)
+    redis.call('EXPIRE', key, window + 5)
+    return 0
+end
+"""
+
 class RedisRateLimiter:
     """
-    Distributed sliding-window rate limiter using Redis sorted sets.
+    Production-grade distributed rate limiter using atomic Redis Lua scripts.
+    Guarantees no race conditions, prevents timestamp collisions, and enforces fail-closed behavior.
     """
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._client = None
+        self._script = None
         try:
             import redis
             self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+            self._script = self._client.register_script(LUA_SLIDING_WINDOW_SCRIPT)
         except Exception:
             self._client = None
 
     def is_rate_limited(self, key: str, max_requests: int, window_seconds: int = 60) -> Optional[int]:
-        if not self._client:
+        if not self._client or not self._script:
+            if settings.ENVIRONMENT == "production":
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Security Protection Error: Distributed rate limiting cluster is unreachable (failing closed)."
+                )
             return None
+
         now = time.time()
         cutoff = now - window_seconds
         redis_key = f"rate_limit:{key}"
+        member = f"{now}:{uuid.uuid4().hex[:8]}"
 
         try:
-            pipe = self._client.pipeline()
-            pipe.zremrangebyscore(redis_key, 0, cutoff)
-            pipe.zcard(redis_key)
-            pipe.zadd(redis_key, {str(now): now})
-            pipe.expire(redis_key, window_seconds + 5)
-            results = pipe.execute()
-
-            request_count = results[1]
-            if request_count >= max_requests:
-                # Exceeded
-                return max(1, int(window_seconds))
-            return None
+            res = self._script(
+                keys=[redis_key],
+                args=[now, cutoff, max_requests, window_seconds, member]
+            )
+            retry_after = int(res)
+            return retry_after if retry_after > 0 else None
         except Exception:
+            if settings.ENVIRONMENT == "production":
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Security Protection Error: Rate limiter execution failed (failing closed)."
+                )
             return None
 
     def reset(self):
@@ -93,9 +127,6 @@ def get_limiter():
 limiter = get_limiter()
 
 def is_trusted_proxy(ip_str: str) -> bool:
-    """
-    Verifies if client IP address belongs to configured trusted proxy networks.
-    """
     try:
         ip = ipaddress.ip_address(ip_str)
         for net_str in settings.TRUSTED_PROXIES:
@@ -110,17 +141,11 @@ def is_trusted_proxy(ip_str: str) -> bool:
     return False
 
 def get_client_ip(request: Request) -> str:
-    """
-    Extracts client IP address safely:
-    Only trusts X-Forwarded-For if request comes directly from a verified TRUSTED_PROXY.
-    Otherwise strictly returns request.client.host.
-    """
     direct_ip = request.client.host if request.client else "127.0.0.1"
     
     if is_trusted_proxy(direct_ip):
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
-            # First IP in X-Forwarded-For is original client
             candidate = forwarded.split(",")[0].strip()
             return candidate
             
