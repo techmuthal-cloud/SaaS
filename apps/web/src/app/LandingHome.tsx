@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { SignedIn, SignedOut, SignInButton, UserButton } from "@clerk/nextjs";
+import { Show, SignInButton, UserButton } from "@clerk/nextjs";
 import {
   ShieldCheck,
   TrendingUp,
@@ -46,16 +46,16 @@ export default function LandingHome({ onGoToApp }: LandingHomeProps) {
           <a href="#features" className="text-xs text-slate-300 hover:text-white font-medium transition hidden md:inline-block">
             Dispute Engine
           </a>
-          <SignedOut>
+          <Show when="signed-out">
             <SignInButton mode="modal">
               <button className="bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs px-3.5 py-2 rounded-lg border border-slate-700 transition">
                 Sign In
               </button>
             </SignInButton>
-          </SignedOut>
-          <SignedIn>
-            <UserButton afterSignOutUrl="/" />
-          </SignedIn>
+          </Show>
+          <Show when="signed-in">
+            <UserButton />
+          </Show>
           <button
             onClick={onGoToApp}
             className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg shadow-lg shadow-emerald-500/20 transition flex items-center gap-1.5"
