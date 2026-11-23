@@ -714,4 +714,18 @@ def test_invalid_bank_statement_date_returns_400():
     assert res.status_code == 400
     assert "Invalid date format" in res.json()["detail"]
 
+def test_owner_tally_export_success():
+    """Verify owner or authorized role can successfully export Tally DayBook XML without crashing."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"tally_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.get(f"/api/v1/workspaces/{ws_id}/export-tally", headers=headers)
+    assert res.status_code == 200
+    assert "application/xml" in res.headers["content-type"]
+    assert "<ENVELOPE>" in res.text
+    assert "<TALLYREQUEST>Import Data</TALLYREQUEST>" in res.text
+
+
 

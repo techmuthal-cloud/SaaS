@@ -8,6 +8,14 @@ class TallyExporterService:
     """
 
     @classmethod
+    def generate_daybook_xml(cls, workspace_id: str, db: Any) -> str:
+        from app.models.entities import Workspace, SettlementTransaction
+        ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        workspace_name = ws.name if ws else "SellerFlow Company"
+        txns = db.query(SettlementTransaction).filter(SettlementTransaction.workspace_id == workspace_id).all()
+        return cls.generate_tally_xml(workspace_name=workspace_name, settlement_txns=txns)
+
+    @classmethod
     def generate_tally_xml(
         cls,
         workspace_name: str,
