@@ -1,7 +1,9 @@
 "use client";
 
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { useAuth } from "@clerk/nextjs";
 import LandingHome from "./LandingHome";
+import { fetchWithAuth, API_BASE } from "../lib/api";
 import {
   UploadCloud,
   FileSpreadsheet,
@@ -45,9 +47,8 @@ import {
   Cell
 } from "recharts";
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000") + "/api/v1";
-
 export default function AppEntry() {
+  const { getToken, isLoaded, isSignedIn } = useAuth();
   const [viewMode, setViewMode] = useState<"landing" | "workspace">("landing");
 
   const [workspaces, setWorkspaces] = useState<any[]>([]);
@@ -101,60 +102,63 @@ export default function AppEntry() {
   const [reviewNote, setReviewNote] = useState("");
   const [reviewSubmitted, setReviewSubmitted] = useState(false);
 
+  const loadWorkspaceData = useCallback(async (wsId: string, storeFilter: string = "all") => {
+    try {
+      const st = await fetchWithAuth(`/workspaces/${wsId}/stores`, {}, getToken);
+      setStores(st || []);
+
+      const imp = await fetchWithAuth(`/workspaces/${wsId}/imports`, {}, getToken);
+      setImports(imp || []);
+
+      const reconUrl = storeFilter && storeFilter !== "all"
+        ? `/workspaces/${wsId}/reconciliation/latest?store_id=${storeFilter}`
+        : `/workspaces/${wsId}/reconciliation/latest`;
+      const recon = await fetchWithAuth(reconUrl, {}, getToken);
+      setReconciliation(recon);
+
+      const prods = await fetchWithAuth(`/workspaces/${wsId}/products`, {}, getToken);
+      setProducts(prods || []);
+
+      const leak = await fetchWithAuth(`/workspaces/${wsId}/returns-leakage`, {}, getToken);
+      setReturnLeakages(leak);
+
+      const wf = await fetchWithAuth(`/workspaces/${wsId}/waterfall`, {}, getToken);
+      setWaterfallData(wf);
+
+      const sc = await fetchWithAuth(`/workspaces/${wsId}/settlement-cycle-recon`, {}, getToken);
+      setSettlementCycle(sc);
+
+      const mp = await fetchWithAuth(`/workspaces/${wsId}/multi-marketplace-pivot`, {}, getToken);
+      setMultiMarketplacePivot(mp);
+
+      const cr = await fetchWithAuth(`/workspaces/${wsId}/cohort-returns`, {}, getToken);
+      setCohortReturns(cr);
+    } catch (err) {
+      console.error("Error loading workspace data:", err);
+    }
+  }, [getToken]);
+
   useEffect(() => {
-    fetch(`${API_BASE}/workspaces`)
-      .then((res) => res.json())
-      .then((data) => {
+    if (!isLoaded || !isSignedIn) return;
+
+    fetchWithAuth("/workspaces", {}, getToken)
+      .then(async (data) => {
         if (data && data.length > 0) {
           setWorkspaces(data);
           setCurrentWs(data[0]);
           loadWorkspaceData(data[0].id, "all");
+        } else {
+          // Auto-provision initial workspace
+          const formData = new FormData();
+          formData.append("name", "Primary Seller Workspace");
+          const newWs = await fetchWithAuth("/workspaces", { method: "POST", body: formData }, getToken);
+          setWorkspaces([newWs]);
+          setCurrentWs(newWs);
+          loadWorkspaceData(newWs.id, "all");
         }
       })
       .catch((err) => console.error("Error loading workspaces", err));
-  }, []);
-
-  const loadWorkspaceData = (wsId: string, storeFilter: string = "all") => {
-    fetch(`${API_BASE}/workspaces/${wsId}/stores`)
-      .then((res) => res.json())
-      .then((st) => setStores(st));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/imports`)
-      .then((res) => res.json())
-      .then((imp) => setImports(imp));
-
-    const reconUrl = storeFilter && storeFilter !== "all"
-      ? `${API_BASE}/workspaces/${wsId}/reconciliation/latest?store_id=${storeFilter}`
-      : `${API_BASE}/workspaces/${wsId}/reconciliation/latest`;
-
-    fetch(reconUrl)
-      .then((res) => res.json())
-      .then((recon) => setReconciliation(recon));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/products`)
-      .then((res) => res.json())
-      .then((prods) => setProducts(prods));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/returns-leakage`)
-      .then((res) => res.json())
-      .then((leak) => setReturnLeakages(leak));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/waterfall`)
-      .then((res) => res.json())
-      .then((wf) => setWaterfallData(wf));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/settlement-cycle-recon`)
-      .then((res) => res.json())
-      .then((sc) => setSettlementCycle(sc));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/multi-marketplace-pivot`)
-      .then((res) => res.json())
-      .then((mp) => setMultiMarketplacePivot(mp));
-
-    fetch(`${API_BASE}/workspaces/${wsId}/cohort-returns`)
-      .then((res) => res.json())
-      .then((cr) => setCohortReturns(cr));
-  };
+  }, [isLoaded, isSignedIn, getToken, loadWorkspaceData]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0 || !currentWs) return;
@@ -176,21 +180,17 @@ export default function AppEntry() {
     }, 200);
 
     try {
-      const res = await fetch(`${API_BASE}/workspaces/${currentWs.id}/imports`, {
+      await fetchWithAuth(`/workspaces/${currentWs.id}/imports`, {
         method: "POST",
         body: formData,
-      });
+      }, getToken);
       clearInterval(interval);
       setUploadProgress(100);
 
-      if (res.ok) {
-        await triggerReconciliation();
-      } else {
-        const err = await res.json();
-        alert(`Upload error: ${err.detail || "Failed to process file"}`);
-      }
-    } catch (err) {
-      alert("Network error connecting to API");
+      await triggerReconciliation();
+    } catch (err: any) {
+      clearInterval(interval);
+      alert(`Upload error: ${err.message || "Failed to process file"}`);
     } finally {
       clearInterval(interval);
       setTimeout(() => {
@@ -206,12 +206,12 @@ export default function AppEntry() {
     setReconciling(true);
     try {
       const url = selectedStoreId !== "all" 
-        ? `${API_BASE}/workspaces/${currentWs.id}/reconcile?store_id=${selectedStoreId}`
-        : `${API_BASE}/workspaces/${currentWs.id}/reconcile`;
-      await fetch(url, { method: "POST" });
+        ? `/workspaces/${currentWs.id}/reconcile?store_id=${selectedStoreId}`
+        : `/workspaces/${currentWs.id}/reconcile`;
+      await fetchWithAuth(url, { method: "POST" }, getToken);
       loadWorkspaceData(currentWs.id, selectedStoreId);
     } catch (err) {
-      console.error(err);
+      console.error("Reconciliation error:", err);
     } finally {
       setReconciling(false);
     }
@@ -222,52 +222,76 @@ export default function AppEntry() {
     setDrawerOrderId(orderId);
     setLoadingEvidence(true);
     try {
-      const res = await fetch(`${API_BASE}/workspaces/${currentWs.id}/evidence/${orderId}`);
-      const data = await res.json();
+      const data = await fetchWithAuth(`/workspaces/${currentWs.id}/evidence/${orderId}`, {}, getToken);
       setEvidenceData(data);
     } catch (e) {
-      console.error(e);
+      console.error("Evidence drawer error:", e);
     } finally {
       setLoadingEvidence(false);
     }
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (!currentWs) return;
-    window.open(`${API_BASE}/workspaces/${currentWs.id}/reconciliation/export`, "_blank");
+    try {
+      const blob = await fetchWithAuth<Blob>(`/workspaces/${currentWs.id}/discrepancies/batch-manifest`, {}, getToken);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `SellerFlow_Discrepancies_${currentWs.name}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      alert("Failed to export reconciliation CSV");
+    }
   };
 
-  const handleExportTallyXML = () => {
+  const handleExportTallyXML = async () => {
     if (!currentWs) return;
-    window.open(`${API_BASE}/workspaces/${currentWs.id}/export/tally-xml`, "_blank");
+    try {
+      const blob = await fetchWithAuth<Blob>(`/workspaces/${currentWs.id}/export-tally`, {}, getToken);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `SellerFlow_Tally_DayBook_${currentWs.name}.xml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      alert("Failed to export Tally XML");
+    }
   };
 
   const handleGenerateDispute = async (discrepancyId: string) => {
     if (!currentWs) return;
     try {
       const formData = new FormData();
-      formData.append("seller_name", currentWs.name);
-      const res = await fetch(`${API_BASE}/workspaces/${currentWs.id}/discrepancies/${discrepancyId}/dispute-package`, {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
+      formData.append("marketplace", selectedMarketplace);
+      const data = await fetchWithAuth(
+        `/workspaces/${currentWs.id}/discrepancies/${discrepancyId}/dispute-package`,
+        { method: "POST", body: formData },
+        getToken
+      );
       setDisputePackage(data);
       setCopiedDispute(false);
-    } catch (err) {
-      alert("Failed to generate dispute ticket");
+    } catch (err: any) {
+      alert(`Failed to generate dispute ticket: ${err.message || ""}`);
     }
   };
 
   const handleBatchManifestExport = async () => {
     if (!currentWs || selectedDiscrepancyIds.length === 0) return;
     try {
-      const res = await fetch(`${API_BASE}/workspaces/${currentWs.id}/discrepancies/batch-manifest`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(selectedDiscrepancyIds),
-      });
-      const blob = await res.blob();
+      const blob = await fetchWithAuth<Blob>(
+        `/workspaces/${currentWs.id}/discrepancies/batch-manifest`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(selectedDiscrepancyIds),
+        },
+        getToken
+      );
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -286,16 +310,21 @@ export default function AppEntry() {
     const formData = new FormData();
     formData.append("sku", editingProduct.sku);
     formData.append("title", editingProduct.title || editingProduct.sku);
-    formData.append("cogs", cogsInput || "0");
-    formData.append("packaging", pkgInput || "0");
-    formData.append("shipping", shipInput || "0");
+    formData.append("cogs_amount", cogsInput || "0");
+    formData.append("packaging_cost", pkgInput || "0");
+    formData.append("shipping_estimate", shipInput || "0");
 
-    await fetch(`${API_BASE}/workspaces/${currentWs.id}/products`, {
-      method: "POST",
-      body: formData,
-    });
-    setEditingProduct(null);
-    loadWorkspaceData(currentWs.id, selectedStoreId);
+    try {
+      await fetchWithAuth(
+        `/workspaces/${currentWs.id}/products`,
+        { method: "POST", body: formData },
+        getToken
+      );
+      setEditingProduct(null);
+      loadWorkspaceData(currentWs.id, selectedStoreId);
+    } catch (err: any) {
+      alert(`Failed to save product costs: ${err.message || ""}`);
+    }
   };
 
   const filteredDiscrepancies = useMemo(() => {

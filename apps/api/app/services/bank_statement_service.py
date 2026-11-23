@@ -25,9 +25,12 @@ class BankStatementService:
         "reference_number": "reference_number",
         "utr": "reference_number",
         "debit": "debit_amount",
+        "debit_amount": "debit_amount",
         "withdrawal": "debit_amount",
         "credit": "credit_amount",
+        "credit_amount": "credit_amount",
         "deposit": "credit_amount",
+        "amount": "credit_amount",
         "balance": "balance",
         "closing_balance": "balance"
     }
@@ -78,7 +81,7 @@ class BankStatementService:
 
                 parsed_txns.append({
                     "source_row": row_idx,
-                    "value_date": row_dict.get("value_date", datetime.utcnow().strftime("%Y-%m-%d")),
+                    "value_date": row_dict.get("value_date", ""),
                     "narration": row_dict.get("narration", "Bank Transaction"),
                     "reference_number": row_dict.get("reference_number"),
                     "credit_amount": credit,

@@ -10,7 +10,16 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Q
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from jose import jwt
+import jwt
+
+def make_json_serializable(obj):
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_serializable(v) for v in obj]
+    return obj
 
 from app.core.database import get_db
 from app.core.config import settings
@@ -153,32 +162,43 @@ def register_user(
     _rate_limit: None = Depends(rate_limit_register),
     db: Session = Depends(get_db)
 ):
+    if settings.ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Local password registration is disabled in production. Use Clerk authentication."
+        )
+
     existing = db.query(User).filter(User.email == email.lower().strip()).first()
     if existing:
         raise HTTPException(status_code=400, detail="A user with this email already exists")
 
     hashed = get_password_hash(password)
-    user = User(email=email.lower().strip(), full_name=full_name, hashed_password=hashed)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    try:
+        user = User(email=email.lower().strip(), full_name=full_name, hashed_password=hashed)
+        db.add(user)
+        db.flush()
 
-    # Create primary workspace for new user
-    ws_name = workspace_name or f"{user.full_name or 'My'} E-Commerce"
-    ws = Workspace(name=ws_name, subscription_tier="free")
-    db.add(ws)
-    db.commit()
-    db.refresh(ws)
+        # Create primary workspace for new user atomically
+        ws_name = workspace_name or f"{user.full_name or 'My'} E-Commerce"
+        ws = Workspace(name=ws_name, subscription_tier="free")
+        db.add(ws)
+        db.flush()
 
-    # Assign user as Owner
-    member = WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="owner")
-    db.add(member)
+        # Assign user as Owner
+        member = WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="owner")
+        db.add(member)
 
-    # Seed default stores
-    db.add(Store(workspace_id=ws.id, display_name="Amazon India Store", marketplace_code="amazon_in"))
-    db.add(Store(workspace_id=ws.id, display_name="Flipkart Store", marketplace_code="flipkart"))
-    db.add(Store(workspace_id=ws.id, display_name="Meesho Supplier Store", marketplace_code="meesho"))
-    db.commit()
+        # Seed default stores
+        db.add(Store(workspace_id=ws.id, display_name="Amazon India Store", marketplace_code="amazon_in"))
+        db.add(Store(workspace_id=ws.id, display_name="Flipkart Store", marketplace_code="flipkart"))
+        db.add(Store(workspace_id=ws.id, display_name="Meesho Supplier Store", marketplace_code="meesho"))
+        db.commit()
+        db.refresh(user)
+        db.refresh(ws)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to register user: {e}")
+        raise HTTPException(status_code=500, detail="Failed to complete user registration.")
 
     token = create_access_token({"sub": user.id, "email": user.email})
     return {
@@ -195,6 +215,12 @@ def login_user(
     _rate_limit: None = Depends(rate_limit_login),
     db: Session = Depends(get_db)
 ):
+    if settings.ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Local password authentication is disabled in production. Use Clerk authentication."
+        )
+
     user = db.query(User).filter(User.email == email.lower().strip()).first()
     if not user or not user.hashed_password or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -256,6 +282,7 @@ def list_workspaces(
 
 @router.post("/workspaces")
 def create_workspace(
+    request: Request,
     name: str = Form(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -263,6 +290,7 @@ def create_workspace(
     """
     Creates a new workspace and assigns current_user as owner in the same atomic database transaction.
     """
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     try:
         ws = Workspace(name=name, subscription_tier="free")
         db.add(ws)
@@ -281,7 +309,8 @@ def create_workspace(
         db.refresh(ws)
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create workspace: {str(e)}")
+        logger.error(f"[request_id={request_id}] Failed to create workspace: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create workspace. Reference Request ID: {request_id}")
 
     return {"id": ws.id, "name": ws.name, "subscription_tier": ws.subscription_tier, "role": "owner"}
 
@@ -292,13 +321,17 @@ def get_stores(
     db: Session = Depends(get_db)
 ):
     stores = db.query(Store).filter(Store.workspace_id == workspace_id).all()
-    if not stores:
-        db.add(Store(workspace_id=workspace_id, display_name="Amazon India Store", marketplace_code="amazon_in"))
-        db.add(Store(workspace_id=workspace_id, display_name="Flipkart India Store", marketplace_code="flipkart"))
-        db.add(Store(workspace_id=workspace_id, display_name="Meesho Supplier Store", marketplace_code="meesho"))
-        db.commit()
-        stores = db.query(Store).filter(Store.workspace_id == workspace_id).all()
-    return stores
+    return [
+        {
+            "id": s.id,
+            "workspace_id": s.workspace_id,
+            "marketplace_code": s.marketplace_code,
+            "display_name": s.display_name,
+            "status": s.status,
+            "created_at": s.created_at.isoformat() if s.created_at else None
+        }
+        for s in stores
+    ]
 
 # ----------------- Secure Multi-Marketplace Ingestion -----------------
 @router.post("/workspaces/{workspace_id}/imports")
@@ -318,15 +351,15 @@ async def upload_report(
     file_path = None
     import_rec = None
 
-    # Enforce role-based access control: viewer cannot upload reports
+    # Enforce role-based access control: only owner, admin, or accountant can upload
     member = db.query(WorkspaceMember).filter(
         WorkspaceMember.workspace_id == workspace_id,
         WorkspaceMember.user_id == current_user.id
     ).first()
-    if member and member.role == "viewer":
+    if not member or member.role not in ("owner", "admin", "accountant"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: Viewer role is not authorized to upload financial reports"
+            detail="Access denied: Viewer role is not authorized. Uploading reports requires owner, admin, or accountant role"
         )
 
     # Cross-tenant store verification: reject any store_id not belonging to this workspace
@@ -345,16 +378,9 @@ async def upload_report(
     try:
         # 1. Enforce upload size limit during streaming read before full buffering
         file_bytes = await read_upload_stream_safely(file)
-        
-        # 2. Content & magic-bytes validation, format verification, safe UUID storage path
-        safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
-        
-        # 3. Store upload in Supabase Storage quarantine
-        file_path = storage.save(workspace_id, safe_storage_filename, file_bytes, is_quarantined=True)
-
         sha256 = hashlib.sha256(file_bytes).hexdigest()
 
-        # Check for idempotent duplicate upload
+        # Check for duplicate upload BEFORE saving to storage to prevent orphan objects
         existing_completed = JobQueueService.check_duplicate_upload(workspace_id, sha256, db)
         if existing_completed:
             return {
@@ -365,6 +391,12 @@ async def upload_report(
                 "idempotent_replay": True,
                 "message": "File was previously processed. Returning existing record."
             }
+        
+        # 2. Content & magic-bytes validation, format verification, safe UUID storage path
+        safe_storage_filename = validate_and_sanitize_upload(file_bytes, file.filename)
+        
+        # 3. Store upload in Supabase Storage quarantine
+        file_path = storage.save(workspace_id, safe_storage_filename, file_bytes, is_quarantined=True)
 
         import_rec = ImportRecord(
             workspace_id=workspace_id,
@@ -421,22 +453,26 @@ async def upload_report(
             else:
                 norm = AmazonSettlementAdapter.normalize_row(r)
 
+            # Ensure payload is JSON-serializable (converts Decimal to string)
+            serializable_norm = make_json_serializable(norm)
+
             src = SourceRecord(
                 workspace_id=workspace_id,
                 import_id=import_rec.id,
-                source_row_number=norm["source_row"] or 0,
+                source_row_number=norm.get("source_row") or 0,
                 record_type="settlement_transaction",
-                raw_payload=r,
-                normalized_payload=norm,
+                raw_payload=make_json_serializable(r),
+                normalized_payload=serializable_norm,
                 validation_status="valid"
             )
             db.add(src)
 
+            order_id_val = norm.get("order_id")
             st = SettlementTransaction(
                 workspace_id=workspace_id,
                 store_id=store_id,
                 import_id=import_rec.id,
-                external_order_id=norm.get("order_id"),
+                external_order_id=order_id_val,
                 transaction_type=norm.get("transaction_type", "Order"),
                 amount_type=norm.get("amount_type"),
                 amount_description=norm.get("amount_description"),
@@ -445,6 +481,28 @@ async def upload_report(
                 source_row_number=norm.get("source_row")
             )
             db.add(st)
+
+            # Ingest OrderRecord if order ID present
+            if order_id_val and str(norm.get("transaction_type", "")).lower() in ("order", "shipment", "itemprice", "other"):
+                clean_oid = str(order_id_val).strip()
+                existing_ord = db.query(OrderRecord).filter(
+                    OrderRecord.workspace_id == workspace_id,
+                    OrderRecord.external_order_id == clean_oid
+                ).first()
+                if not existing_ord:
+                    new_ord = OrderRecord(
+                        workspace_id=workspace_id,
+                        store_id=store_id,
+                        import_id=import_rec.id,
+                        external_order_id=clean_oid,
+                        sku=norm.get("sku"),
+                        order_date=datetime.utcnow(),
+                        gross_amount=norm.get("amount", Decimal("0.00")),
+                        net_order_amount=norm.get("amount", Decimal("0.00")),
+                        currency=norm.get("currency", "INR")
+                    )
+                    db.add(new_ord)
+
             accepted += 1
 
         import_rec.accepted_count = accepted
@@ -484,23 +542,50 @@ async def upload_report(
             safe_cleanup_file(file_path)
         raise
     except Exception as e:
+        db.rollback()
         if file_path:
             storage.delete(file_path)
             safe_cleanup_file(file_path)
         if import_rec:
             try:
-                import_rec.status = "failed"
-                import_rec.error_summary = {"error": "Processing failed"}
-                db.commit()
+                failed_rec = db.query(ImportRecord).filter(ImportRecord.id == import_rec.id).first()
+                if failed_rec:
+                    failed_rec.status = "failed"
+                    failed_rec.error_summary = {"error": "Processing failed due to malformed row data"}
+                    db.commit()
             except Exception:
-                pass
+                db.rollback()
         logger.error(f"[request_id={request_id}] Import processing failed for file={file.filename}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to process settlement report: Invalid or malformed file structure. Reference Request ID: {request_id}"
         )
 
-# ----------------- Authenticated Import Job Status Polling -----------------
+# ----------------- Authenticated Import Job Status & Listing -----------------
+@router.get("/workspaces/{workspace_id}/imports")
+def list_imports(
+    workspace_id: str,
+    ws: Workspace = Depends(verify_tenant_access),
+    db: Session = Depends(get_db)
+):
+    imports = db.query(ImportRecord).filter(
+        ImportRecord.workspace_id == workspace_id
+    ).order_by(ImportRecord.created_at.desc()).limit(50).all()
+    return [
+        {
+            "id": imp.id,
+            "file_name": imp.file_name,
+            "report_type": imp.report_type,
+            "status": imp.status,
+            "row_count": imp.row_count,
+            "accepted_count": imp.accepted_count,
+            "rejected_count": imp.rejected_count,
+            "created_at": imp.created_at.isoformat() if imp.created_at else None,
+            "processed_at": imp.processed_at.isoformat() if imp.processed_at else None
+        }
+        for imp in imports
+    ]
+
 @router.get("/workspaces/{workspace_id}/imports/{import_id}/status")
 def get_import_status(
     workspace_id: str,
@@ -549,19 +634,26 @@ def run_reconciliation(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Reconciliation execution requires owner, admin, or accountant role"
         )
+
+    # Derive marketplace from authorized store if store_id specified
+    if store_id and store_id != "all":
+        st = db.query(Store).filter(Store.id == store_id, Store.workspace_id == workspace_id).first()
+        if st:
+            marketplace = st.marketplace_code
+
     orders_q = db.query(OrderRecord).filter(OrderRecord.workspace_id == workspace_id)
-    if store_id:
+    if store_id and store_id != "all":
         orders_q = orders_q.filter(OrderRecord.store_id == store_id)
     orders = orders_q.all()
 
     txns_q = db.query(SettlementTransaction).filter(SettlementTransaction.workspace_id == workspace_id)
-    if store_id:
+    if store_id and store_id != "all":
         txns_q = txns_q.filter(SettlementTransaction.store_id == store_id)
     settlements = txns_q.all()
 
     run = ReconciliationRun(
         workspace_id=workspace_id,
-        store_id=store_id,
+        store_id=store_id if store_id != "all" else None,
         ruleset_version=ReconciliationEngine.RULESET_VERSION,
         rate_card_version=RateCardEngine.VERSION,
         status="processing"
@@ -604,6 +696,49 @@ def run_reconciliation(
         "discrepancies_count": len(results["discrepancies"])
     }
 
+@router.get("/workspaces/{workspace_id}/reconciliation/latest")
+def get_latest_reconciliation(
+    workspace_id: str,
+    store_id: Optional[str] = Query(None),
+    ws: Workspace = Depends(verify_tenant_access),
+    db: Session = Depends(get_db)
+):
+    query = db.query(ReconciliationRun).filter(ReconciliationRun.workspace_id == workspace_id)
+    if store_id and store_id != "all":
+        query = query.filter(ReconciliationRun.store_id == store_id)
+    latest_run = query.order_by(ReconciliationRun.created_at.desc()).first()
+    if not latest_run:
+        return {
+            "status": "not_run",
+            "summary": {
+                "total_discrepancies": 0,
+                "total_overcharge_amount": "0.00",
+                "status": "not_reconciled"
+            },
+            "discrepancies": []
+        }
+    discrepancies = db.query(Discrepancy).filter(Discrepancy.run_id == latest_run.id).all()
+    return {
+        "run_id": latest_run.id,
+        "status": latest_run.status,
+        "summary": latest_run.summary or {},
+        "created_at": latest_run.created_at.isoformat() if latest_run.created_at else None,
+        "discrepancies": [
+            {
+                "id": d.id,
+                "category": d.category,
+                "severity": d.severity,
+                "status": d.status,
+                "title": d.title,
+                "explanation": d.explanation,
+                "order_id": d.external_order_id,
+                "difference_amount": str(d.difference_amount),
+                "currency": d.currency
+            }
+            for d in discrepancies
+        ]
+    }
+
 # ----------------- Discrepancies & Sanitized Exports -----------------
 @router.get("/workspaces/{workspace_id}/discrepancies")
 def get_discrepancies(
@@ -634,6 +769,7 @@ def get_discrepancies(
     ]
 
 @router.get("/workspaces/{workspace_id}/discrepancies/batch-manifest")
+@router.post("/workspaces/{workspace_id}/discrepancies/batch-manifest")
 def export_batch_manifest(
     workspace_id: str,
     ws: Workspace = Depends(verify_tenant_access),
@@ -731,6 +867,178 @@ def generate_dispute(
         charged_weight_grams=int(evidence.get("charged_weight_grams", 1000))
     )
     return pkg
+
+@router.post("/workspaces/{workspace_id}/discrepancies/{discrepancy_id}/dispute-package")
+def generate_dispute_for_discrepancy(
+    workspace_id: str,
+    discrepancy_id: str,
+    marketplace: Optional[str] = Form("amazon_in"),
+    ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant", "member"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Dispute generation requires owner, admin, accountant, or member role"
+        )
+    disc = db.query(Discrepancy).filter(
+        Discrepancy.workspace_id == workspace_id,
+        (Discrepancy.id == discrepancy_id) | (Discrepancy.external_order_id == discrepancy_id)
+    ).first()
+
+    if not disc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Discrepancy '{discrepancy_id}' not found in workspace '{workspace_id}'."
+        )
+
+    order_id = disc.external_order_id or discrepancy_id
+    claim_amount = abs(disc.difference_amount or Decimal("0.00"))
+    disc_type = disc.category or "Contracted Marketplace Fee Overcharge"
+
+    order_rec = db.query(OrderRecord).filter(
+        OrderRecord.workspace_id == workspace_id,
+        OrderRecord.external_order_id == order_id
+    ).first()
+    sku = order_rec.sku if (order_rec and order_rec.sku) else (disc.title or "SKU-DISPUTE-ITEM")
+    evidence = disc.evidence_payload or {}
+    expected_fee = Decimal(str(evidence.get("expected_fee", "0.00")))
+    actual_fee = Decimal(str(evidence.get("actual_fee", str(claim_amount))))
+
+    pkg = DisputeGeneratorService.generate_ticket(
+        marketplace=marketplace,
+        order_id=order_id,
+        sku=sku,
+        discrepancy_type=disc_type,
+        expected_fee=expected_fee,
+        actual_charged_fee=actual_fee,
+        overcharge_amount=claim_amount,
+        actual_weight_grams=int(evidence.get("actual_weight_grams", 500)),
+        charged_weight_grams=int(evidence.get("charged_weight_grams", 1000))
+    )
+    return pkg
+
+# ----------------- Evidence Drawer API -----------------
+@router.get("/workspaces/{workspace_id}/evidence/{order_id}")
+def get_order_evidence(
+    workspace_id: str,
+    order_id: str,
+    ws: Workspace = Depends(verify_tenant_access),
+    db: Session = Depends(get_db)
+):
+    transactions = db.query(SettlementTransaction).filter(
+        SettlementTransaction.workspace_id == workspace_id,
+        SettlementTransaction.external_order_id == order_id
+    ).all()
+    disc = db.query(Discrepancy).filter(
+        Discrepancy.workspace_id == workspace_id,
+        Discrepancy.external_order_id == order_id
+    ).first()
+    order = db.query(OrderRecord).filter(
+        OrderRecord.workspace_id == workspace_id,
+        OrderRecord.external_order_id == order_id
+    ).first()
+
+    return {
+        "order_id": order_id,
+        "sku": order.sku if order else None,
+        "discrepancy": {
+            "category": disc.category if disc else None,
+            "severity": disc.severity if disc else None,
+            "difference_amount": str(disc.difference_amount) if disc else "0.00",
+            "explanation": disc.explanation if disc else None
+        } if disc else None,
+        "transactions": [
+            {
+                "id": tx.id,
+                "transaction_type": tx.transaction_type,
+                "amount_type": tx.amount_type,
+                "amount_description": tx.amount_description,
+                "amount": str(tx.amount),
+                "currency": tx.currency,
+                "source_row": tx.source_row_number
+            }
+            for tx in transactions
+        ]
+    }
+
+# ----------------- Product Margin Configuration -----------------
+@router.get("/workspaces/{workspace_id}/products")
+def list_products(
+    workspace_id: str,
+    ws: Workspace = Depends(verify_tenant_access),
+    db: Session = Depends(get_db)
+):
+    prods = db.query(Product).filter(Product.workspace_id == workspace_id).all()
+    return [
+        {
+            "id": p.id,
+            "sku": p.sku,
+            "title": p.title,
+            "category": p.category,
+            "weight_grams": p.weight_grams,
+            "cogs_amount": str(p.cogs_amount),
+            "packaging_cost": str(p.packaging_cost),
+            "shipping_estimate": str(p.shipping_estimate),
+            "currency": p.currency
+        }
+        for p in prods
+    ]
+
+@router.post("/workspaces/{workspace_id}/products")
+def create_or_update_product(
+    workspace_id: str,
+    sku: str = Form(...),
+    title: Optional[str] = Form(None),
+    category: Optional[str] = Form("General"),
+    weight_grams: Optional[int] = Form(500),
+    cogs_amount: Optional[float] = Form(0.0),
+    packaging_cost: Optional[float] = Form(0.0),
+    shipping_estimate: Optional[float] = Form(0.0),
+    ws: Workspace = Depends(verify_tenant_access),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    if not member or member.role not in ("owner", "admin", "accountant"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Modifying products requires owner, admin, or accountant role"
+        )
+    prod = db.query(Product).filter(
+        Product.workspace_id == workspace_id,
+        Product.sku == sku.strip()
+    ).first()
+    if not prod:
+        prod = Product(
+            workspace_id=workspace_id,
+            sku=sku.strip(),
+            title=title,
+            category=category or "General",
+            weight_grams=weight_grams or 500,
+            cogs_amount=Decimal(str(cogs_amount or 0.0)),
+            packaging_cost=Decimal(str(packaging_cost or 0.0)),
+            shipping_estimate=Decimal(str(shipping_estimate or 0.0))
+        )
+        db.add(prod)
+    else:
+        if title: prod.title = title
+        if category: prod.category = category
+        if weight_grams: prod.weight_grams = weight_grams
+        if cogs_amount is not None: prod.cogs_amount = Decimal(str(cogs_amount))
+        if packaging_cost is not None: prod.packaging_cost = Decimal(str(packaging_cost))
+        if shipping_estimate is not None: prod.shipping_estimate = Decimal(str(shipping_estimate))
+    db.commit()
+    db.refresh(prod)
+    return {"id": prod.id, "sku": prod.sku, "status": "saved"}
 
 # ----------------- Return & RTO Leakage Detection -----------------
 @router.get("/workspaces/{workspace_id}/returns-leakage")
@@ -848,26 +1156,39 @@ async def upload_bank_statement(
     try:
         file_bytes = await read_upload_stream_safely(file)
         safe_filename = validate_and_sanitize_upload(file_bytes, file.filename)
-        file_path = storage.save(workspace_id, safe_filename, file_bytes, is_quarantined=False)
+        # Store in quarantine first
+        file_path = storage.save(workspace_id, safe_filename, file_bytes, is_quarantined=True)
         text_stream = io.StringIO(file_bytes.decode("utf-8", errors="replace"))
 
         parsed = BankStatementService.parse_csv(text_stream)
+        if not parsed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No valid bank transaction rows found in the uploaded statement. Reference Request ID: {request_id}"
+            )
 
         # Get or create default bank account
         acct = db.query(BankAccount).filter(BankAccount.workspace_id == workspace_id).first()
         if not acct:
             acct = BankAccount(workspace_id=workspace_id, bank_name="Primary Business Account", account_number_mask="XXXX-8821")
             db.add(acct)
-            db.commit()
-            db.refresh(acct)
+            db.flush()
 
         inserted = 0
-        for t in parsed:
-            val_date = datetime.utcnow().date()
-            try:
-                val_date = datetime.strptime(t["value_date"][:10], "%Y-%m-%d").date()
-            except Exception:
-                pass
+        for idx, t in enumerate(parsed, start=1):
+            raw_date = str(t.get("value_date", "")).strip()
+            val_date = None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%b-%Y"):
+                try:
+                    val_date = datetime.strptime(raw_date[:10], fmt).date()
+                    break
+                except Exception:
+                    continue
+            if not val_date:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid date format in bank statement row {idx}: '{raw_date}'. Expected format YYYY-MM-DD or DD/MM/YYYY. Reference Request ID: {request_id}"
+                )
 
             bt = BankTransaction(
                 workspace_id=workspace_id,
@@ -882,10 +1203,20 @@ async def upload_bank_statement(
             inserted += 1
 
         db.commit()
+
+        # Promote storage file to verified only after database commit succeeds
+        storage.promote_from_quarantine(file_path)
         return {"status": "success", "transactions_imported": inserted}
     except HTTPException:
+        if file_path:
+            storage.delete(file_path)
+            safe_cleanup_file(file_path)
         raise
     except Exception as e:
+        db.rollback()
+        if file_path:
+            storage.delete(file_path)
+            safe_cleanup_file(file_path)
         logger.error(f"[request_id={request_id}] Bank statement upload failed for file={file.filename}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

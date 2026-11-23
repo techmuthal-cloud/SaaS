@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from fastapi import HTTPException
 
 from app.main import app
+from app.core.config import settings
 from app.core.security import (
     sanitize_for_spreadsheet,
     validate_and_sanitize_upload,
@@ -588,5 +589,129 @@ def test_storage_provider_quarantine_workflow():
     # Clean up
     deleted = storage.delete(verified_path)
     assert deleted is True
+
+def test_production_mode_rejects_local_auth_routes(monkeypatch):
+    """Verify S02: Local password login & register routes are disabled in production."""
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+
+    reg_res = client.post("/api/v1/auth/register", json={"email": "prod_user@example.com", "password": "Password123!"})
+    assert reg_res.status_code == 403
+    assert "disabled in production" in reg_res.json()["detail"]
+
+    login_res = client.post("/api/v1/auth/login", json={"email": "prod_user@example.com", "password": "Password123!"})
+    assert login_res.status_code == 403
+    assert "disabled in production" in login_res.json()["detail"]
+
+def test_get_stores_is_idempotent_read_only():
+    """Verify S03: GET stores does not mutate DB or create stores on read."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"stores_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res1 = client.get(f"/api/v1/workspaces/{ws_id}/stores", headers=headers)
+    assert res1.status_code == 200
+    count1 = len(res1.json())
+
+    res2 = client.get(f"/api/v1/workspaces/{ws_id}/stores", headers=headers)
+    assert res2.status_code == 200
+    assert len(res2.json()) == count1
+
+def test_workspace_creation_error_sanitization_no_raw_sqlexception(monkeypatch):
+    """Verify S09: Database errors return generic message and request ID without raw str(e)."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"ws_err_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy.orm import Session
+    def mock_commit(self):
+        raise RuntimeError("CRITICAL: SQL Connection Terminated: SELECT * FROM credentials")
+
+    monkeypatch.setattr(Session, "commit", mock_commit)
+
+    res = client.post("/api/v1/workspaces", headers=headers, data={"name": "Broken Workspace"})
+    assert res.status_code == 500
+    assert "Failed to create workspace" in res.json()["detail"]
+    assert "Reference Request ID:" in res.json()["detail"]
+    # Ensure raw exception / SQL string is NOT leaked to client
+    assert "CRITICAL: SQL Connection Terminated" not in res.json()["detail"]
+
+def test_import_with_decimal_payload_serialization_success():
+    """Verify F03: Settlement upload with Decimal values serializes into JSON column without TypeError."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"decimal_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    csv_data = (
+        "order_id,transaction_type,amount_type,amount,currency\n"
+        "ORD-DEC-001,Order,ItemPrice,1499.50,INR\n"
+        "ORD-DEC-001,Order,Commission,-150.00,INR\n"
+    ).encode("utf-8")
+
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/imports",
+        headers=headers,
+        files={"file": ("amazon_settlement_test.csv", csv_data, "text/csv")},
+        data={"marketplace": "amazon_in"}
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "completed"
+    assert res.json()["rows_processed"] == 2
+
+def test_new_api_contracts_imports_reconciliation_products_evidence():
+    """Verify F02: Complete frontend-facing contracts exist and return valid data."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"contract_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. List imports
+    imp_res = client.get(f"/api/v1/workspaces/{ws_id}/imports", headers=headers)
+    assert imp_res.status_code == 200
+    assert isinstance(imp_res.json(), list)
+
+    # 2. Get latest reconciliation
+    recon_res = client.get(f"/api/v1/workspaces/{ws_id}/reconciliation/latest", headers=headers)
+    assert recon_res.status_code == 200
+    assert "summary" in recon_res.json()
+
+    # 3. Product create & list
+    p_create = client.post(
+        f"/api/v1/workspaces/{ws_id}/products",
+        headers=headers,
+        data={"sku": "SKU-TEST-100", "cogs_amount": "250.00", "weight_grams": "600"}
+    )
+    assert p_create.status_code == 200
+    assert p_create.json()["status"] == "saved"
+
+    p_list = client.get(f"/api/v1/workspaces/{ws_id}/products", headers=headers)
+    assert p_list.status_code == 200
+    assert any(p["sku"] == "SKU-TEST-100" for p in p_list.json())
+
+    # 4. Evidence drawer endpoint
+    ev_res = client.get(f"/api/v1/workspaces/{ws_id}/evidence/ORD-DEC-001", headers=headers)
+    assert ev_res.status_code == 200
+    assert "transactions" in ev_res.json()
+
+def test_invalid_bank_statement_date_returns_400():
+    """Verify F06: Invalid date format in bank statement returns 400 error rather than defaulting to today."""
+    reg = client.post("/api/v1/auth/register", json={"email": f"bank_date_user_{uuid.uuid4().hex[:6]}@example.com", "password": "Password123!"})
+    token = reg.json()["access_token"]
+    ws_id = reg.json()["workspace"]["id"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    malformed_csv = (
+        "value_date,narration,credit_amount,debit_amount\n"
+        "NOT-A-REAL-DATE,Deposit from Amazon,1000.00,0.00\n"
+    ).encode("utf-8")
+
+    res = client.post(
+        f"/api/v1/workspaces/{ws_id}/bank-statements/upload",
+        headers=headers,
+        files={"file": ("bad_bank.csv", malformed_csv, "text/csv")}
+    )
+    assert res.status_code == 400
+    assert "Invalid date format" in res.json()["detail"]
 
 

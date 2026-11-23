@@ -52,7 +52,23 @@ class SupabaseStorageProvider(StorageProvider):
         prefix = "quarantine" if is_quarantined else "verified"
         path = f"{prefix}/{workspace_id}/{filename}"
         
-        # If in test/offline environment without active credentials, fall back safely
+        # In production, require remote Supabase storage and fail explicitly on error
+        if settings.ENVIRONMENT == "production":
+            if not self.supabase_url or not self.service_key:
+                raise RuntimeError("FATAL: Supabase storage credentials missing in production.")
+            url = f"{self.supabase_url}/storage/v1/object/{self.bucket}/{path}"
+            headers = self._get_headers()
+            headers["x-upsert"] = "true"
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status in (200, 201):
+                        return f"supabase://{self.bucket}/{path}"
+            except Exception as e:
+                logger.error(f"Production Supabase Storage upload failed: {e}")
+                raise RuntimeError(f"Storage Error: Failed to upload file to durable storage: {e}")
+
+        # In offline/dev/test environments without Supabase credentials, use local storage provider
         if not self.supabase_url or not self.service_key:
             return LocalStorageProvider(settings.STORAGE_DIR).save(workspace_id, filename, data, is_quarantined)
 
@@ -116,7 +132,11 @@ class SupabaseStorageProvider(StorageProvider):
                         if resp.status == 200:
                             return f"supabase://{self.bucket}/{new_path}"
                 except Exception as e:
-                    logger.warning(f"Supabase Storage move failed: {e}")
+                    logger.error(f"Supabase Storage move failed: {e}")
+                    if settings.ENVIRONMENT == "production":
+                        raise RuntimeError(f"Storage Error: Failed to promote file from quarantine: {e}")
+        if settings.ENVIRONMENT == "production":
+            raise RuntimeError(f"Storage Error: Cannot promote non-supabase storage path in production: {storage_path}")
         return LocalStorageProvider(settings.STORAGE_DIR).promote_from_quarantine(storage_path)
 
     def get_signed_url(self, storage_path: str, expires_in: int = 3600) -> Optional[str]:

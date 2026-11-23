@@ -10,7 +10,8 @@ import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from fastapi import Header, HTTPException, status, Depends, UploadFile
-from jose import JWTError, jwt
+import jwt
+from jwt import PyJWKClient, PyJWTError, ExpiredSignatureError, InvalidIssuerError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -67,85 +68,106 @@ def get_password_hash(password: str) -> str:
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     secret = get_jwt_secret()
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
+    now = datetime.utcnow()
+    expire = now + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "iat": now, "nbf": now})
     return jwt.encode(to_encode, secret, algorithm=settings.JWT_ALGORITHM)
 
-_CLERK_JWKS_CACHE = None
+_CLERK_JWK_CLIENT = None
 
-def get_clerk_jwks():
-    global _CLERK_JWKS_CACHE
-    if _CLERK_JWKS_CACHE is None and settings.CLERK_JWKS_URL:
+def get_clerk_jwk_client() -> Optional[PyJWKClient]:
+    global _CLERK_JWK_CLIENT
+    if _CLERK_JWK_CLIENT is None and settings.CLERK_JWKS_URL:
         try:
-            req = urllib.request.Request(settings.CLERK_JWKS_URL, headers={"User-Agent": "SellerFlow-Backend"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                _CLERK_JWKS_CACHE = json.loads(resp.read().decode("utf-8"))
+            _CLERK_JWK_CLIENT = PyJWKClient(
+                settings.CLERK_JWKS_URL,
+                cache_keys=True,
+                max_cached_keys=16,
+                cache_jwk_set=True,
+                lifespan=3600
+            )
         except Exception as e:
-            logger.warning(f"Could not load Clerk JWKS: {e}")
-    return _CLERK_JWKS_CACHE
+            logger.warning(f"Could not initialize Clerk JWK client: {e}")
+    return _CLERK_JWK_CLIENT
 
 def verify_clerk_token_jwks(token: str) -> Optional[dict]:
     """
-    Verifies Clerk RS256 token against Clerk JWKS validating issuer and subject.
+    Verifies Clerk RS256 token against Clerk JWKS validating issuer, subject, expiry and authorized party.
+    Uses bounded caching and refreshes key set on unknown key ID.
+    Does NOT fall back to backend symmetric secrets.
     """
+    jwk_client = get_clerk_jwk_client()
+    if not jwk_client:
+        return None
+
     try:
-        unverified_header = jwt.get_unverified_header(token)
-        kid = unverified_header.get("kid")
-        jwks = get_clerk_jwks()
-        
-        rsa_key = {}
-        if jwks and "keys" in jwks:
-            for key in jwks["keys"]:
-                if key.get("kid") == kid:
-                    rsa_key = key
-                    break
+        signing_key = jwk_client.get_signing_key_from_jwt(token)
+        decode_options = {
+            "require": ["exp", "sub"],
+            "verify_exp": True,
+            "verify_nbf": True,
+            "verify_iat": True,
+            "verify_aud": False,
+        }
+        issuer = settings.CLERK_ISSUER if settings.CLERK_ISSUER else None
+        if settings.ENVIRONMENT == "production" and not issuer:
+            raise RuntimeError("FATAL: CLERK_ISSUER is required in production environment.")
 
-        if rsa_key:
-            payload = jwt.decode(
-                token,
-                rsa_key,
-                algorithms=["RS256"],
-                issuer=settings.CLERK_ISSUER,
-                options={"verify_aud": False}
-            )
-            return payload
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options=decode_options
+        )
+
+        # Validate authorized party (azp) if configured
+        if settings.CLERK_AUTHORIZED_PARTIES:
+            azp = payload.get("azp")
+            if azp and azp not in settings.CLERK_AUTHORIZED_PARTIES:
+                logger.warning(f"Clerk token rejected: unauthorized azp {azp}")
+                return None
+
+        return payload
+    except (ExpiredSignatureError, InvalidIssuerError, PyJWTError) as e:
+        logger.debug(f"Clerk token verification rejected: {e}")
+        return None
     except Exception as e:
-        logger.debug(f"Clerk JWKS token verification failed: {e}")
-        
-    if settings.CLERK_SECRET_KEY:
-        try:
-            payload = jwt.decode(
-                token,
-                settings.CLERK_SECRET_KEY,
-                algorithms=["HS256", "RS256"],
-                options={"verify_aud": False}
-            )
-            return payload
-        except Exception:
-            pass
+        logger.warning(f"Clerk token verification error: {e}")
+        return None
 
-    return None
-
-def fetch_clerk_user_email(clerk_user_id: str) -> Optional[str]:
+def fetch_clerk_user_email(clerk_user_id: str) -> Tuple[Optional[str], bool]:
     """
-    Fetches real verified primary email address for user from Clerk Backend API.
+    Fetches real email address and verification status for user from Clerk Backend API.
+    Returns (email_address, is_verified).
     """
     if not settings.CLERK_SECRET_KEY:
-        return None
+        return None, False
     try:
         url = f"https://api.clerk.com/v1/users/{clerk_user_id}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             emails = data.get("email_addresses", [])
+            primary_id = data.get("primary_email_address_id")
+
+            # Check primary email first
             for e in emails:
-                if e.get("id") == data.get("primary_email_address_id"):
-                    return e.get("email_address")
+                if e.get("id") == primary_id:
+                    addr = e.get("email_address")
+                    is_verified = (e.get("verification", {}).get("status") == "verified")
+                    return addr, is_verified
+
+            # Check any verified email
+            for e in emails:
+                if e.get("verification", {}).get("status") == "verified":
+                    return e.get("email_address"), True
+
             if emails:
-                return emails[0].get("email_address")
-    except Exception:
-        pass
-    return None
+                return emails[0].get("email_address"), False
+    except Exception as e:
+        logger.debug(f"Failed to fetch Clerk user email: {e}")
+    return None, False
 
 def get_current_user(
     authorization: Optional[str] = Header(None),
@@ -183,7 +205,12 @@ def get_current_user(
             )
         try:
             secret = get_jwt_secret()
-            payload = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
+            payload = jwt.decode(
+                token,
+                secret,
+                algorithms=[settings.JWT_ALGORITHM],
+                options={"require": ["sub", "exp"], "verify_exp": True}
+            )
             user_id = payload.get("sub")
             if not user_id:
                 raise HTTPException(
@@ -191,7 +218,7 @@ def get_current_user(
                     detail="Invalid token payload: missing subject identifier",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-        except JWTError:
+        except PyJWTError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired authentication credentials",
@@ -202,17 +229,22 @@ def get_current_user(
 
     # Provision user record from real Clerk profile
     if not user and is_clerk_verified:
-        verified_email = fetch_clerk_user_email(user_id) or f"clerk_{user_id}@clerk.user"
-        user = User(
-            id=user_id,
-            clerk_id=user_id,
-            email=verified_email,
-            full_name="Clerk Verified User",
-            is_active=True
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+        email_addr, is_verified = fetch_clerk_user_email(user_id)
+        user_email = email_addr or f"{user_id}@unverified.clerk"
+        try:
+            user = User(
+                id=user_id,
+                clerk_id=user_id,
+                email=user_email,
+                full_name="Clerk Verified User" if is_verified else "Clerk User",
+                is_active=True
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        except Exception:
+            db.rollback()
+            user = db.query(User).filter((User.id == user_id) | (User.clerk_id == user_id)).first()
 
     if not user or not user.is_active:
         raise HTTPException(

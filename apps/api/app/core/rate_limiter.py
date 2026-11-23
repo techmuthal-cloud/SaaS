@@ -71,10 +71,19 @@ class RedisRateLimiter:
         self._script = None
         try:
             import redis
-            self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+            self._client = redis.Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=3,
+                socket_connect_timeout=3
+            )
             self._script = self._client.register_script(LUA_SLIDING_WINDOW_SCRIPT)
-        except Exception:
+            # Test ping
+            self._client.ping()
+        except Exception as e:
             self._client = None
+            if settings.ENVIRONMENT == "production":
+                raise RuntimeError(f"FATAL: Redis distributed rate limiter failed to connect: {e}")
 
     def is_rate_limited(self, key: str, max_requests: int, window_seconds: int = 60) -> Optional[int]:
         if not self._client or not self._script:
@@ -115,6 +124,11 @@ class RedisRateLimiter:
                 pass
 
 def get_limiter():
+    if settings.ENVIRONMENT == "production":
+        if not settings.REDIS_URL:
+            raise RuntimeError("FATAL: REDIS_URL is required in production environment.")
+        return RedisRateLimiter(settings.REDIS_URL)
+
     if settings.REDIS_URL:
         try:
             rl = RedisRateLimiter(settings.REDIS_URL)
@@ -147,7 +161,11 @@ def get_client_ip(request: Request) -> str:
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             candidate = forwarded.split(",")[0].strip()
-            return candidate
+            try:
+                # Normalize and validate IP format
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
             
     return direct_ip
 
